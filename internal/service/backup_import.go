@@ -200,6 +200,7 @@ type ImportRepoStats struct {
 	// not imported, so re-running the import retries them.
 	BlobsFailed  int    `json:"blobsFailed"`
 	ConflictMode string `json:"conflictMode"`
+	FailureReport
 }
 
 // ImportRepo reads a per-repository archive (as produced by ExportRepo) and
@@ -326,6 +327,7 @@ func (s *BackupService) importRepoComponents(ctx context.Context, components []d
 		comp.RepositoryID = destRepo.ID
 		comp.Repository = finalName
 		if err := s.Components.Create(ctx, comp); err != nil {
+			s.recordFailure(&stats.FailureReport, "import", "component", finalName+"/"+componentLabel(comp), err)
 			continue
 		}
 		compIDMap[oldID] = comp.ID
@@ -357,8 +359,8 @@ func (s *BackupService) importRepoAssets(ctx context.Context, assets []domain.As
 		// that cannot be written leaves its asset out (see putArchivedBlob).
 		if a.BlobKey != "" && arc.hasBlob(a.BlobKey) {
 			if err := s.putArchivedBlob(ctx, stores, arc, a.BlobKey, blobStoreID); err != nil {
-				s.logWarn("import: blob write failed, asset skipped", "key", a.BlobKey, "err", err)
 				stats.BlobsFailed++
+				s.recordFailure(&stats.FailureReport, "import", "asset", finalName+a.Path, fmt.Errorf("write blob %s: %w", a.BlobKey, err))
 				continue
 			}
 		}
@@ -371,6 +373,7 @@ func (s *BackupService) importRepoAssets(ctx context.Context, assets []domain.As
 			a.BlobStoreID = blobStoreID
 		}
 		if err := s.Assets.Create(ctx, a); err != nil {
+			s.recordFailure(&stats.FailureReport, "import", "asset", finalName+a.Path, err)
 			continue
 		}
 		stats.Assets++
@@ -450,7 +453,9 @@ func (s *BackupService) restoreBlobStores(ctx context.Context, blobStores []doma
 		if bs.Type == "group" {
 			members := remapGroupMembers(bs.Config["member_ids"], oldBSIDToName, bsNameToID)
 			if len(members) == 0 {
-				continue // none of its members exist here: an empty group is not a valid store
+				// An empty group is not a valid store.
+				s.recordFailure(&stats.FailureReport, "restore", "blobStore", bs.Name, errors.New("none of its member stores exist or could be restored"))
+				continue
 			}
 			cfg := make(map[string]any, len(bs.Config))
 			for k, v := range bs.Config {
@@ -461,6 +466,7 @@ func (s *BackupService) restoreBlobStores(ctx context.Context, blobStores []doma
 		}
 		bs.ID = "" // let DB assign
 		if err := s.BlobStores.Create(ctx, bs); err != nil {
+			s.recordFailure(&stats.FailureReport, "restore", "blobStore", bs.Name, err)
 			continue
 		}
 		bsNameToID[bs.Name] = bs.ID
@@ -594,6 +600,7 @@ func (s *BackupService) restoreRepos(ctx context.Context, repos []domain.Reposit
 			}
 		}
 		if err := s.Repos.Create(ctx, repo); err != nil {
+			s.recordFailure(&stats.FailureReport, "restore", "repository", repo.Name, err)
 			continue
 		}
 		repoNameToID[repo.Name] = repo.ID
@@ -614,6 +621,7 @@ func (s *BackupService) restoreUsers(ctx context.Context, users []backupUser, st
 		domUser.PasswordHash = u.PasswordHash
 		domUser.ID = ""
 		if err := s.Users.Create(ctx, &domUser); err != nil {
+			s.recordFailure(&stats.FailureReport, "restore", "user", u.Username, err)
 			continue
 		}
 		stats.Users++
@@ -630,6 +638,7 @@ func (s *BackupService) restoreRoles(ctx context.Context, roles []domain.Role, s
 		}
 		role.ID = ""
 		if err := s.Roles.Create(ctx, role); err != nil {
+			s.recordFailure(&stats.FailureReport, "restore", "role", role.Name, err)
 			continue
 		}
 		stats.Roles++
@@ -646,6 +655,7 @@ func (s *BackupService) restorePolicies(ctx context.Context, policies []domain.C
 		}
 		p.ID = ""
 		if err := s.Policies.Create(ctx, p); err != nil {
+			s.recordFailure(&stats.FailureReport, "restore", "cleanupPolicy", p.Name, err)
 			continue
 		}
 		stats.Policies++
@@ -666,6 +676,7 @@ func (s *BackupService) restoreComponents(ctx context.Context, components []doma
 		comp.RepositoryID = repoID
 		comp.ID = ""
 		if err := s.Components.Create(ctx, comp); err != nil {
+			s.recordFailure(&stats.FailureReport, "restore", "component", comp.Repository+"/"+componentLabel(comp), err)
 			continue
 		}
 		compIDMap[oldID] = comp.ID
@@ -704,8 +715,8 @@ func (s *BackupService) restoreAssets(ctx context.Context, assets []domain.Asset
 		// that cannot be written leaves its asset out (see putArchivedBlob).
 		if a.BlobKey != "" && arc.hasBlob(a.BlobKey) {
 			if err := s.putArchivedBlob(ctx, stores, arc, a.BlobKey, newBSID); err != nil {
-				s.logWarn("restore: blob write failed, asset skipped", "key", a.BlobKey, "err", err)
 				stats.BlobsFailed++
+				s.recordFailure(&stats.FailureReport, "restore", "asset", a.Repository+a.Path, fmt.Errorf("write blob %s: %w", a.BlobKey, err))
 				continue
 			}
 			stats.Blobs++
@@ -716,6 +727,7 @@ func (s *BackupService) restoreAssets(ctx context.Context, assets []domain.Asset
 		a.BlobStoreID = newBSID
 		a.ID = ""
 		if err := s.Assets.Create(ctx, a); err != nil {
+			s.recordFailure(&stats.FailureReport, "restore", "asset", a.Repository+a.Path, err)
 			continue
 		}
 		stats.Assets++
