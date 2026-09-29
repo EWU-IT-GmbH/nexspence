@@ -50,7 +50,9 @@ LABEL org.opencontainers.image.title="Nexspence EWU NuGet-search variant" \
       org.opencontainers.image.version="${VERSION}"
 RUN addgroup -g 1000 nexspence && adduser -D -u 1000 -G nexspence nexspence \
     && mkdir -p /app/data/blobs /app/.cache /app/secrets \
-    && chmod +x /app/entrypoint.sh && chown -R nexspence:nexspence /app
+    && chmod +x /app/entrypoint.sh && chown -R nexspence:nexspence /app \
+    && epoch_days=$(( ${SOURCE_DATE_EPOCH:-0} / 86400 )) \
+    && sed -i "s/^nexspence:!:.*$/nexspence:!:${epoch_days}:0:99999:7:::/" /etc/shadow
 ENV HOME=/app
 ENV TRIVY_CACHE_DIR=/app/.cache/trivy
 USER 1000

@@ -82,10 +82,13 @@ def main():
     if digests[0] != digests[1]:
         raise RuntimeError('Independent runtime image manifests differ')
     with (output / 'source-export.log').open('w') as log:
-        run(*common, '--target', 'source-export', '--output', f'type=local,dest={output / "export"}',
+        run(*common, '--target', 'source-export', '--output', f'type=tar,dest={output / "source-tree.tar"}',
             str(context), stdout=log, stderr=subprocess.STDOUT)
+    with tarfile.open(output / 'source-tree.tar') as tar:
+        tar.extractall(output / 'export', filter='data')
     source = output / 'export/source'
-    metadata = {'version': args.version, 'revision': revision, 'sourceDateEpoch': int(epoch),
+    metadata = {'dockerBuildx': subprocess.check_output(['docker', 'buildx', 'version'], text=True).strip(),
+                'version': args.version, 'revision': revision, 'sourceDateEpoch': int(epoch),
                 'platform': 'linux/amd64', 'runtimeManifestDigest': digests[0],
                 'rebuildRuntimeManifestDigest': digests[1],
                 'note': 'SBOM/provenance attestations have run-specific metadata; runtime manifests are compared.'}
