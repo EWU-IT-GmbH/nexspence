@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Build a committed revision twice; export OCI image and corresponding sources.
+"""Build a committed revision twice; export OCI images and fixed source revision metadata.
 Requires Python 3, Git, Docker Buildx (OCI exporter), network for the first build.
 """
 import argparse
-import gzip
 import hashlib
 import json
 import os
@@ -59,7 +58,7 @@ def main():
     output.mkdir(parents=True, exist_ok=False)
     context = output / 'context'
     context.mkdir()
-    # Only committed, reviewed content enters the build or source artifact.
+    # Only committed content enters the temporary build context.
     tree = output / 'checkout.tar'
     run('git', 'archive', '--format=tar', '-o', str(tree), revision)
     with tarfile.open(tree) as tar:
@@ -81,32 +80,18 @@ def main():
         print(f'Build {number} runtime manifest: {digests[-1]}', flush=True)
     if digests[0] != digests[1]:
         raise RuntimeError('Independent runtime image manifests differ')
-    with (output / 'source-export.log').open('w') as log:
-        run(*common, '--target', 'source-export', '--output', f'type=tar,dest={output / "source-tree.tar"}',
-            str(context), stdout=log, stderr=subprocess.STDOUT)
-    with tarfile.open(output / 'source-tree.tar') as tar:
-        tar.extractall(output / 'export', filter='data')
-    source = output / 'export/source'
     metadata = {'dockerBuildx': subprocess.check_output(['docker', 'buildx', 'version'], text=True).strip(),
                 'version': args.version, 'revision': revision, 'sourceDateEpoch': int(epoch),
                 'platform': 'linux/amd64', 'runtimeManifestDigest': digests[0],
                 'rebuildRuntimeManifestDigest': digests[1],
                 'note': 'SBOM/provenance attestations have run-specific metadata; runtime manifests are compared.'}
-    (source / 'EWU-RELEASE.json').write_text(json.dumps(metadata, indent=2) + '\n')
-    source_tar = output / f'nexspence-{args.version}-source.tar.gz'
-    with source_tar.open('wb') as raw, gzip.GzipFile(fileobj=raw, mode='wb', filename='', mtime=0) as compressed:
-        with tarfile.open(fileobj=compressed, mode='w|', format=tarfile.GNU_FORMAT) as tar:
-            def normalize(info):
-                info.uid = info.gid = 0
-                info.uname = info.gname = ''
-                info.mtime = int(epoch)
-                return info
-            tar.add(source, arcname='nexspence-' + args.version, filter=normalize)
-    metadata['sourceArchive'] = source_tar.name
-    metadata['sourceSHA256'] = sha(source_tar)
+    metadata['sourceURL'] = 'https://github.com/EWU-IT-GmbH/nexspence'
+    metadata['sourceRevisionURL'] = metadata['sourceURL'] + '/tree/' + revision
+    metadata['sourceTag'] = args.version
     metadata['ociArchiveSHA256'] = sha(output / 'image-1.oci.tar')
     (output / 'release.json').write_text(json.dumps(metadata, indent=2) + '\n')
-    (output / 'SHA256SUMS').write_text(f"{metadata['sourceSHA256']}  {source_tar.name}\n{metadata['ociArchiveSHA256']}  image-1.oci.tar\n")
+    # The private OCI archive is not a public release asset.
+    (output / 'SHA256SUMS').write_text(f"{sha(output / 'release.json')}  release.json\n")
     print(json.dumps(metadata, indent=2), flush=True)
 
 

@@ -20,6 +20,18 @@
 
 </div>
 
+## EWU NuGet-search fork
+
+This is the [EWU fork](https://github.com/EWU-IT-GmbH/nexspence), based on upstream
+**v2.5.1**, with NuGet search and registration changes. Maintenance:
+EWU-Infrastruktur-Team. The upstream overview and deployment examples below
+remain upstream documentation; they do not select the EWU image.
+
+See [BUILDING-EWU.md](BUILDING-EWU.md) for the EWU build and release workflow.
+GitHub Actions builds the private image `ghcr.io/ewu-it-gmbh/nexspence`; release
+metadata identifies its digest and matching public source tag/commit. No separate
+source archive is generated. The workflow does not deploy the service.
+
 ---
 
 ## 🎬 Demo

@@ -19,12 +19,6 @@ RUN if [ ! -d node_modules ]; then npm ci --no-audit --no-fund; fi
 ARG SOURCE_DATE_EPOCH
 RUN npm run build
 
-# Corresponding source: exact checkout plus Go vendor and npm dependency contents,
-# including the dependency license files. No .git, credentials or runtime data.
-FROM scratch AS source-export
-COPY --from=builder /src/ /source/
-COPY --from=frontend-builder /frontend/node_modules/ /source/frontend/node_modules/
-
 FROM alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6 AS runtime
 # Avoid an unpinned apk transaction. CA roots and tzdata come from the pinned builder.
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
@@ -43,9 +37,9 @@ COPY --from=builder /src/BUILDING-EWU.md /app/BUILDING-EWU.md
 LABEL org.opencontainers.image.title="Nexspence EWU NuGet-search variant" \
       org.opencontainers.image.description="Modified Nexspence v2.5.1 with NuGet search" \
       org.opencontainers.image.licenses="AGPL-3.0-or-later" \
-      org.opencontainers.image.source="https://git.adam-crm.dev/ewu/infrastruktur/nexspence" \
-      org.opencontainers.image.url="https://artifacts.adam-crm.de" \
-      org.opencontainers.image.documentation="https://git.adam-crm.dev/ewu/infrastruktur/nexspence" \
+      org.opencontainers.image.source="https://github.com/EWU-IT-GmbH/nexspence" \
+      org.opencontainers.image.url="https://github.com/EWU-IT-GmbH/nexspence" \
+      org.opencontainers.image.documentation="https://github.com/EWU-IT-GmbH/nexspence" \
       org.opencontainers.image.revision="${REVISION}" \
       org.opencontainers.image.version="${VERSION}"
 RUN addgroup -g 1000 nexspence && adduser -D -u 1000 -G nexspence nexspence \
