@@ -28,3 +28,26 @@ go.mod, go.sum and frontend/package-lock.json for the authoritative list.
 The container image also ships the Trivy scanner (Apache-2.0), which Nexspence
 invokes as a separate executable rather than linking, and therefore distributes
 under Trivy's own terms.
+
+--------------------------------------------------------------------------------
+
+Modified distribution: EWU NuGet-search variant
+Modification dates: 2026-09-29 to 2026-09-30
+Based on Nexspence v2.5.1, commit d5070ba188a8d96d2b3b2539d4762ad8f3b8ba62.
+Maintained by: EWU-Infrastruktur-Team.
+
+This variant adds NuGet v3 hosted/group search, metadata catalog and backfill,
+registration/version aggregation, bounded remote search, permission filtering,
+client-discovery compatibility, and associated tests and build documentation.
+It is a modified version, not an unmodified upstream release.
+The modified work is provided under AGPL-3.0-or-later, with the license and
+warranty terms stated above. Upstream attribution is retained.
+
+Build and source-delivery requirements for this variant are documented in
+BUILDING-EWU.md. The source offer must identify the exact deployed revision;
+a private development repository or the upstream repository alone does not
+constitute that offer to users without access.
+
+Scanner clarification for this variant: the root Dockerfile does not bundle
+Trivy. The preceding upstream scanner notice applies if Trivy is separately
+included; its license obligations must then also be met.

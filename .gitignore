@@ -75,3 +75,6 @@ release-bundle/
 
 # Local security audit notes — never publish
 SECURITY-AUDIT-*.md
+
+# Private release work products are exported outside the source snapshot.
+release-output/

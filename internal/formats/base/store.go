@@ -214,6 +214,17 @@ func RegisterStoredBlob(ctx context.Context, d formats.Deps, repo *domain.Reposi
 		prev = nil
 	}
 
+	extra := coords.Extra
+	if extra != nil {
+		extra = make(map[string]any, len(coords.Extra)+2)
+		for k, v := range coords.Extra {
+			extra[k] = v
+		}
+		if _, ok := extra["nuget"]; ok {
+			extra["nuget_sha256"] = sha256sum
+			extra["nuget_path"] = filePath
+		}
+	}
 	version := coords.Version
 	if version == "" {
 		version = "1"
@@ -230,6 +241,7 @@ func RegisterStoredBlob(ctx context.Context, d formats.Deps, repo *domain.Reposi
 		RepositoryID: repo.ID,
 		Repository:   repo.Name,
 		Format:       string(repo.Format),
+		Extra:        extra,
 		Group:        coords.Group,
 		Name:         name,
 		Version:      version,
@@ -574,9 +586,10 @@ func BlobKeyByDigest(digest string) string {
 
 // Coords holds the parsed artifact coordinates used for component records.
 type Coords struct {
-	Group   string // e.g. Maven groupId, npm scope, Go module path
-	Name    string // package/artifact/chart name
-	Version string // semantic version
+	Group   string         // e.g. Maven groupId, npm scope, Go module path
+	Name    string         // package/artifact/chart name
+	Extra   map[string]any // validated format metadata; tied to stored content below
+	Version string         // semantic version
 }
 
 // CheckQuota verifies that writing `size` bytes for repo won't exceed the repository or

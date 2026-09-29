@@ -406,3 +406,20 @@ func evalCELRepoOnly(expr, repoName string) bool {
 	}
 	return false
 }
+
+// SnapshotReadPolicy captures the same evaluator and privileges as CanAccessRepo,
+// once per request so counting and paging cannot observe different permissions.
+func (s *RBACService) SnapshotReadPolicy(ctx context.Context, userID string, roles []string, repo *domain.Repository) (func(string) bool, error) {
+	if isAdmin(roles) || s.anonymousAllowed(repo.AllowAnonymous) {
+		return func(string) bool { return true }, nil
+	}
+	if userID == "" {
+		return func(string) bool { return false }, nil
+	}
+	privs, err := s.rbac.GetUserPrivilegesWithSelectors(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	name := repo.Name
+	return func(path string) bool { return matchPrivileges(privs, name, path, "read") }, nil
+}
