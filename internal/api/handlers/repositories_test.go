@@ -466,3 +466,60 @@ func TestRepositoryHandler_Create_KeepsProxyPasswordStored(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "s3cret", stored.ProxyConfig["proxy_password"])
 }
+
+// Hiding a repository affects discovery only, never artifact authorization.
+func TestRepositoryHandler_AnonymousListingVisibility(t *testing.T) {
+	repos := testutil.NewRepoRepo()
+	seedRepo(t, repos, &domain.Repository{ID: "visible", Name: "docker-public", AllowAnonymous: true})
+	seedRepo(t, repos, &domain.Repository{ID: "hidden", Name: "hosted-docker-public", AllowAnonymous: true, HideFromAnonymousLists: true})
+	seedRepo(t, repos, &domain.Repository{ID: "private", Name: "private"})
+	svc := service.NewRepositoryService(repos, testutil.NewBlobStoreRepo(), testutil.NewBlobStore(), testutil.NewCleanupPolicyRepo())
+	rbac := service.NewRBACService(emptyRBACRepo{}, repos, zap.NewNop().Sugar(), true)
+	h := handlers.NewRepositoryHandler(svc, rbac)
+	for _, tc := range []struct {
+		name, userID string
+		roles        []string
+		count        int
+	}{
+		{name: "anonymous", count: 1},
+		{name: "signed-in", userID: "reader", count: 2},
+		{name: "admin", userID: "admin", roles: []string{"nx-admin"}, count: 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := gin.New()
+			r.Use(func(c *gin.Context) { c.Set("userID", tc.userID); c.Set("roles", tc.roles); c.Next() })
+			r.GET("/repositories", h.List)
+			r.GET("/repositories/:name", h.Get)
+			rec := do(t, r, http.MethodGet, "/repositories", nil)
+			require.Equal(t, http.StatusOK, rec.Code)
+			var got []domain.Repository
+			require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
+			require.Len(t, got, tc.count)
+			if tc.userID == "" {
+				assert.Equal(t, "docker-public", got[0].Name)
+			}
+			rec = do(t, r, http.MethodGet, "/repositories/hosted-docker-public", nil)
+			require.Equal(t, http.StatusOK, rec.Code)
+		})
+	}
+	hidden, err := repos.Get(testContext(), "hosted-docker-public")
+	require.NoError(t, err)
+	allowed, err := rbac.CanAccessRepo(testContext(), "", nil, hidden, "/image/manifests/latest", "read")
+	require.NoError(t, err)
+	assert.True(t, allowed)
+}
+
+func TestRepositoryHandler_ListingVisibilityUpdateAndPatch(t *testing.T) {
+	r, repos, _, _ := mountRepos(t)
+	seedRepo(t, repos, &domain.Repository{ID: "r1", Name: "listing", Format: domain.FormatRaw, Type: domain.TypeHosted, Online: true})
+	for _, hidden := range []bool{true, false} {
+		rec := do(t, r, http.MethodPut, "/service/rest/v1/repositories/raw/hosted/listing", map[string]any{"online": true, "allowAnonymous": true, "hideFromAnonymousLists": hidden})
+		require.Equal(t, http.StatusOK, rec.Code)
+		rec = do(t, r, http.MethodPatch, "/service/rest/v1/repositories/listing", map[string]any{"online": false})
+		require.Equal(t, http.StatusOK, rec.Code)
+		got, err := repos.Get(testContext(), "listing")
+		require.NoError(t, err)
+		assert.Equal(t, hidden, got.HideFromAnonymousLists)
+		assert.True(t, got.AllowAnonymous)
+	}
+}

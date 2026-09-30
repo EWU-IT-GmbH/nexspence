@@ -236,6 +236,7 @@ func (s *RepositoryService) Update(ctx context.Context, name string, updates *do
 		}
 	}
 	r.AllowAnonymous = updates.AllowAnonymous
+	r.HideFromAnonymousLists = updates.HideFromAnonymousLists
 
 	if err := s.validateCleanupPolicies(ctx, r.Format, r.CleanupPolicyIDs); err != nil {
 		return nil, err

@@ -96,23 +96,24 @@ func IsDockerPathComponent(name string) bool {
 
 // Repository is a hosted, proxy, or group artifact repository of a given format.
 type Repository struct {
-	ID               string         `json:"id"`
-	Name             string         `json:"name"`
-	Format           RepoFormat     `json:"format"`
-	Type             RepoType       `json:"type"`
-	BlobStoreID      *string        `json:"blobStoreId,omitempty"`
-	Online           bool           `json:"online"`
-	FormatConfig     map[string]any `json:"formatConfig,omitempty"`
-	HTTPConfig       map[string]any `json:"httpConfig,omitempty"`
-	ProxyConfig      map[string]any `json:"proxyConfig,omitempty"`
-	CleanupPolicyIDs []string       `json:"cleanupPolicyIds,omitempty"`
-	QuotaBytes       *int64         `json:"quotaBytes,omitempty"`
-	RoutingRuleID    *string        `json:"routingRuleId,omitempty"`
-	AllowAnonymous   bool           `json:"allowAnonymous"`
-	Description      string         `json:"description,omitempty"`
-	URL              string         `json:"url,omitempty"` // computed
-	CreatedAt        time.Time      `json:"createdAt"`
-	UpdatedAt        time.Time      `json:"updatedAt"`
+	ID                     string         `json:"id"`
+	Name                   string         `json:"name"`
+	Format                 RepoFormat     `json:"format"`
+	Type                   RepoType       `json:"type"`
+	BlobStoreID            *string        `json:"blobStoreId,omitempty"`
+	Online                 bool           `json:"online"`
+	FormatConfig           map[string]any `json:"formatConfig,omitempty"`
+	HTTPConfig             map[string]any `json:"httpConfig,omitempty"`
+	ProxyConfig            map[string]any `json:"proxyConfig,omitempty"`
+	CleanupPolicyIDs       []string       `json:"cleanupPolicyIds,omitempty"`
+	QuotaBytes             *int64         `json:"quotaBytes,omitempty"`
+	RoutingRuleID          *string        `json:"routingRuleId,omitempty"`
+	HideFromAnonymousLists bool           `json:"hideFromAnonymousLists"`
+	AllowAnonymous         bool           `json:"allowAnonymous"`
+	Description            string         `json:"description,omitempty"`
+	URL                    string         `json:"url,omitempty"` // computed
+	CreatedAt              time.Time      `json:"createdAt"`
+	UpdatedAt              time.Time      `json:"updatedAt"`
 }
 
 // GroupMemberNames returns ordered member repository names from formatConfig["member_names"].
