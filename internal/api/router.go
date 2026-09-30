@@ -251,6 +251,7 @@ func NewRouter(ctx context.Context, cfg *config.Config, pool *pgxpool.Pool, log 
 	}
 
 	formatDeps := formats.Deps{
+		NuGet:        postgres.NewNuGetCatalog(pool),
 		Repos:        repoRepo,
 		Components:   componentRepo,
 		Assets:       assetRepo,
@@ -581,6 +582,7 @@ func NewRouter(ctx context.Context, cfg *config.Config, pool *pgxpool.Pool, log 
 
 	// ── Admin-only endpoints (nx-admin role required) ─────────
 	admin := r.Group("", authMW, adminMW)
+	admin.POST("/api/v1/nuget/:repoName/backfill", nuget.New(formatDeps).ServeBackfill)
 	{
 		// ── Repositories (write) ──────────────────────────────
 		admin.POST("/service/rest/v1/repositories/:format/:type", repoH.Create)
