@@ -11,6 +11,7 @@ import (
 
 // Deps holds all dependencies injected into every format handler.
 type Deps struct {
+	NuGet      repository.NuGetCatalog // local NuGet catalog with snapshot semantics
 	Repos      repository.RepositoryRepo
 	Components repository.ComponentRepo
 	Assets     repository.AssetRepo
@@ -103,4 +104,9 @@ type RBACChecker interface {
 	// compared the way content selectors are written.
 	CanAccessRepo(ctx context.Context, userID string, roles []string,
 		repo *domain.Repository, path, action string) (bool, error)
+}
+
+// ReadPolicySnapshotter freezes read privileges for one metadata response.
+type ReadPolicySnapshotter interface {
+	SnapshotReadPolicy(context.Context, string, []string, *domain.Repository) (func(string) bool, error)
 }

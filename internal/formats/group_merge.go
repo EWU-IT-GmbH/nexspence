@@ -1,6 +1,9 @@
 package formats
 
-import "github.com/gin-gonic/gin"
+import (
+	"github.com/gin-gonic/gin"
+	"github.com/nexspence-oss/nexspence/internal/domain"
+)
 
 // GroupIndexPart is one member's successful index response, in member order.
 type GroupIndexPart struct {
@@ -91,4 +94,10 @@ type GroupIndexPaginator interface {
 	// document and sets whatever cursor header the format's protocol uses on
 	// c. Returning merged unchanged is what an unpaginated path does.
 	PageGroupIndex(c *gin.Context, path string, merged []byte) ([]byte, error)
+}
+
+// GroupRequestHandler resolves format-specific group reads directly. The fallback
+// serves only explicitly selected members, for remote reads absent from a local catalog.
+type GroupRequestHandler interface {
+	ServeGroup(*gin.Context, *domain.Repository, func([]string)) bool
 }

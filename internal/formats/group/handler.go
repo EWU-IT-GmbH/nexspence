@@ -51,6 +51,16 @@ func (h *Handler) ServeHTTP(c *gin.Context) {
 		return
 	}
 
+	// Let formats with a shared catalog resolve a group without member HTTP fan-out.
+	repo, err := h.deps.Repos.Get(c.Request.Context(), c.Param("repoName"))
+	if err == nil && repo != nil {
+		if handler, ok := h.formatRegistry[string(repo.Format)].(formats.GroupRequestHandler); ok {
+			if handler.ServeGroup(c, repo, func(members []string) { h.serveMembers(c, repo, members, nil) }) {
+				return
+			}
+		}
+	}
+
 	switch c.Request.Method {
 	case http.MethodGet, http.MethodHead:
 		h.serveGet(c)
@@ -107,6 +117,14 @@ func (h *Handler) serveGet(c *gin.Context) {
 		}
 	}
 
+	h.serveMembers(c, repoDef, members, rule)
+}
+
+func (h *Handler) serveMembers(c *gin.Context, repoDef *domain.Repository, members []string, rule *domain.RoutingRule) {
+	ctx := c.Request.Context()
+	filePath := c.Param("path")
+	repoName := repoDef.Name
+
 	for _, memberName := range members {
 		if !service.Allow(rule, filePath) {
 			continue
@@ -127,6 +145,10 @@ func (h *Handler) serveGet(c *gin.Context) {
 			code = http.StatusOK
 		}
 		if code == http.StatusNotFound {
+			if c.GetString("nugetExpectedRemoteVersion") == memberName {
+				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "upstream_package_unavailable"})
+				return
+			}
 			continue
 		}
 
@@ -181,6 +203,15 @@ func (h *Handler) callMemberWithQuery(ctx context.Context, c *gin.Context, membe
 	sub.Request = c.Request.Clone(ctx)
 	// Clone deep-copies the URL, so the client's own request is untouched.
 	sub.Request.URL.RawQuery = rawQuery
+	if handler.Name() == "nuget" {
+		for _, key := range []string{"userID", "roles", "tokenScopes"} {
+			if v, ok := c.Get(key); ok {
+				sub.Set(key, v)
+			}
+		}
+		sub.Set("nugetCallerRepository", c.Param("repoName"))
+	}
+
 	sub.Params = gin.Params{
 		{Key: "repoName", Value: memberName},
 		{Key: "path", Value: filePath},
