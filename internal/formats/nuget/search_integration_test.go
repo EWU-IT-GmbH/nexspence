@@ -266,7 +266,7 @@ func TestHostedSearchHTTPParametersAndProxyExclusion(t *testing.T) {
 	for _, tc := range []struct {
 		method, query string
 		status        int
-	}{{"GET", "?take=0", 400}, {"GET", "?take=100", 200}, {"GET", "?q=%XX", 400}, {"GET", "?q=%00", 400}, {"GET", "?q=a&q=b", 400}, {"GET", "?semVerLevel=2.0.0&prerelease=true", 200}, {"HEAD", "", 200}, {"HEAD", "?skip=-1", 400}, {"POST", "", 405}, {"DELETE", "", 405}} {
+	}{{"GET", "?take=0", 400}, {"GET", "?take=100", 200}, {"GET", "?take=300", 200}, {"GET", "?take=1000", 200}, {"GET", "?take=1001", 400}, {"GET", "?q=%XX", 400}, {"GET", "?q=%00", 400}, {"GET", "?q=a&q=b", 400}, {"GET", "?semVerLevel=2.0.0&prerelease=true", 200}, {"HEAD", "", 200}, {"HEAD", "?skip=-1", 400}, {"POST", "", 405}, {"DELETE", "", 405}} {
 		w := httptest.NewRecorder()
 		f.router.ServeHTTP(w, httptest.NewRequest(tc.method, "/repository/hosted/v3/query"+tc.query, nil))
 		require.Equal(t, tc.status, w.Code, w.Body.String())

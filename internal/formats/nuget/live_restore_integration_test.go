@@ -65,7 +65,7 @@ func TestFederatedLiveRestoreGate(t *testing.T) {
 	})
 	server.Config.Handler = router
 	server.Start()
-	response, err := http.Get(server.URL + "/repository/" + feed + "/v3/query?q=packageid%3Anuget.versioning&semVerLevel=2.0.0")
+	response, err := http.Get(server.URL + "/repository/" + feed + "/v3/query?q=Nuget.Versioning&skip=0&take=300&prerelease=true&semVerLevel=2.0.0")
 	require.NoError(t, err)
 	defer response.Body.Close()
 	var result struct {

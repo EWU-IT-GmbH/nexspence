@@ -68,7 +68,7 @@ func parseSearch(raw string) (SearchOptions, error) {
 		k        string
 		dest     *int
 		min, max int
-	}{{"skip", &o.Skip, 0, 10000}, {"take", &o.Take, 1, 100}} {
+	}{{"skip", &o.Skip, 0, 10000}, {"take", &o.Take, 1, 1000}} {
 		if vals, ok := q[p.k]; ok {
 			v := vals[0]
 			if v == "" {

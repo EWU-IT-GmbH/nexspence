@@ -21,7 +21,7 @@ func TestSearchParameterContract(t *testing.T) {
 		_, e := parseSearch(raw)
 		require.NoError(t, e, raw)
 	}
-	for _, raw := range []string{"skip=-1", "skip=+1", "skip=1.0", "skip=10001", "skip=", "take=0", "take=101", "take=", "take=9999999999999999999999999999", "q=a&q=a", "semVerLevel=", "semVerLevel=2.0.0.0", "prerelease=", "prerelease=1", "packageType=Dependency", "q=%FF", "q=%00", "q=%XX", "q=a;b", "q=" + strings.Repeat("a", 257)} {
+	for _, raw := range []string{"skip=-1", "skip=+1", "skip=1.0", "skip=10001", "skip=", "take=0", "take=1001", "take=", "take=9999999999999999999999999999", "q=a&q=a", "semVerLevel=", "semVerLevel=2.0.0.0", "prerelease=", "prerelease=1", "packageType=Dependency", "q=%FF", "q=%00", "q=%XX", "q=a;b", "q=" + strings.Repeat("a", 257)} {
 		_, e := parseSearch(raw)
 		require.Error(t, e, raw)
 		var q *queryError
@@ -89,4 +89,15 @@ func TestHostedSearchFailsClosedWithoutPolicy(t *testing.T) {
 	c.Writer.WriteHeaderNow()
 	require.Equal(t, 503, w.Code)
 	require.JSONEq(t, `{"error":"search_unavailable"}`, w.Body.String())
+}
+
+func TestRiderSearchPageSize(t *testing.T) {
+	o, err := parseSearch("q=Nuget.Versioning&skip=0&take=300&prerelease=true&semVerLevel=2.0.0")
+	require.NoError(t, err)
+	require.Equal(t, 300, o.Take)
+	require.Equal(t, "Nuget.Versioning", o.Query)
+	require.True(t, o.Prerelease)
+	require.True(t, o.SemVer2)
+	_, err = parseSearch("take=1000")
+	require.NoError(t, err)
 }
