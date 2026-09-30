@@ -115,3 +115,18 @@ func TestDirectProxySearchLiveNuGetOrg(t *testing.T) {
 	require.Len(t, result.Data, 1)
 	require.Equal(t, "NuGet.Versioning", result.Data[0].ID)
 }
+
+func TestDirectProxyFullIndexURLResourcePaths(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/v3-index/repository-signatures/5.0.0/index.json", r.URL.Path)
+		fmt.Fprint(w, `{"allRepositorySigned":true}`)
+	}))
+	defer upstream.Close()
+	repo := testutil.SimpleRepo("proxy", "nuget")
+	repo.Type = domain.TypeProxy
+	repo.ProxyConfig = map[string]any{"remote_url": upstream.URL + "/v3/index.json"}
+	w := httptest.NewRecorder()
+	setup(repo).ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/repository/proxy/v3-index/repository-signatures/5.0.0/index.json", nil))
+	require.Equal(t, 200, w.Code, w.Body.String())
+	require.JSONEq(t, `{"allRepositorySigned":true}`, w.Body.String())
+}

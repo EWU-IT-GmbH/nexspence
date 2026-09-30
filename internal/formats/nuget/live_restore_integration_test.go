@@ -38,6 +38,12 @@ func TestFederatedLiveRestoreGate(t *testing.T) {
 	proxy.ProxyConfig = map[string]any{"remote_url": "https://api.nuget.org/v3/index.json"}
 	require.NoError(t, f.deps.Repos.Update(context.Background(), proxy))
 	g := f.addRepo(t, "all", domain.TypeGroup, "hosted", "proxy")
+	feed := "all"
+	if os.Getenv("NEXSPENCE_LIVE_NUGET_DIRECT") == "1" {
+		feed = "proxy"
+		proxy.AllowAnonymous = true
+		require.NoError(t, f.deps.Repos.Update(context.Background(), proxy))
+	}
 	g.AllowAnonymous = true
 	require.NoError(t, f.deps.Repos.Update(context.Background(), g))
 	old := repoproxy.UpstreamClient
@@ -50,18 +56,32 @@ func TestFederatedLiveRestoreGate(t *testing.T) {
 	h := nuget.New(deps)
 	gh := group.New(deps, map[string]formats.FormatHandler{"nuget": h})
 	router := gin.New()
-	router.Any("/repository/:repoName/*path", handlers.RBACMiddleware(deps.RBAC.(*service.RBACService), deps.Repos), gh.ServeHTTP)
+	router.Any("/repository/:repoName/*path", handlers.RBACMiddleware(deps.RBAC.(*service.RBACService), deps.Repos), func(c *gin.Context) {
+		if c.Param("repoName") == "proxy" {
+			h.ServeHTTP(c)
+		} else {
+			gh.ServeHTTP(c)
+		}
+	})
 	server.Config.Handler = router
 	server.Start()
-	response, err := http.Get(server.URL + "/repository/all/v3/query?q=packageid%3ANuGet.Versioning&semVerLevel=2.0.0")
+	response, err := http.Get(server.URL + "/repository/" + feed + "/v3/query?q=packageid%3Anuget.versioning&semVerLevel=2.0.0")
 	require.NoError(t, err)
 	defer response.Body.Close()
-	var result nuget.SearchResponse
+	var result struct {
+		Data []struct {
+			ID      string `json:"id"`
+			Version string `json:"version"`
+		} `json:"data"`
+	}
 	require.NoError(t, json.NewDecoder(response.Body).Decode(&result))
 	require.Equal(t, 200, response.StatusCode)
 	version := ""
 	for _, p := range result.Data {
 		if strings.EqualFold(p.ID, "NuGet.Versioning") {
+			if feed == "proxy" {
+				require.Equal(t, "NuGet.Versioning", p.ID)
+			}
 			version = p.Version
 			break
 		}
@@ -70,9 +90,12 @@ func TestFederatedLiveRestoreGate(t *testing.T) {
 	v, err := nugetmeta.ParseVersion(version)
 	require.NoError(t, err)
 	path := "/v3/flatcontainer/nuget.versioning/" + v.Key() + "/nuget.versioning." + v.Key() + ".nupkg"
+	if feed == "proxy" {
+		path = strings.Replace(path, "/v3/flatcontainer/", "/v3-flatcontainer/", 1)
+	}
 	_, err = f.deps.Assets.GetByPath(context.Background(), "proxy", path)
 	require.Error(t, err, "package bytes must not already be cached")
-	b, err := json.Marshal(map[string]string{"url": server.URL + "/repository/all/index.json", "version": version})
+	b, err := json.Marshal(map[string]string{"url": server.URL + "/repository/" + feed + "/index.json", "version": version})
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "ready.tmp"), b, 0644))
 	require.NoError(t, os.Rename(filepath.Join(dir, "ready.tmp"), filepath.Join(dir, "ready.json")))

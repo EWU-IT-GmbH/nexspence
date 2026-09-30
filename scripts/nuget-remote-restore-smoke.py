@@ -5,6 +5,7 @@ Runs only isolated test repositories/PostgreSQL and an empty .NET package cache.
 No production repository, registry push or deployment is used. Logs are retained
 in the printed temporary directory. Outbound access to nuget.org is required.
 """
+import argparse
 import json
 import os
 from pathlib import Path
@@ -17,6 +18,9 @@ from xml.sax.saxutils import escape
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--direct", action="store_true", help="Test a direct proxy instead of the group")
+    args = parser.parse_args()
     for executable in ("docker", "dotnet"):
         if not shutil.which(executable):
             raise SystemExit(f"Required executable not found: {executable}")
@@ -29,6 +33,7 @@ def main():
         "-v", "/var/run/docker.sock:/var/run/docker.sock",
         "-e", "DOCKER_API_VERSION=1.44",
         "-e", "NEXSPENCE_LIVE_NUGET_SMOKE_DIR=/smoke",
+        "-e", f"NEXSPENCE_LIVE_NUGET_DIRECT={int(args.direct)}",
         "-v", f"{output}:/smoke", "-v", f"{project}:/src:ro", "-w", "/src",
         "-v", "nexspence-go-mod:/go/pkg/mod",
         "-v", "nexspence-go-build:/root/.cache/go-build",
@@ -78,7 +83,7 @@ def main():
             print((output / "server.log").read_text())
             if result.returncode or server_exit:
                 raise RuntimeError("Live acceptance failed; inspect server.log and restore.log")
-            print(f"PASS: clean restore of NuGet.Versioning {gate['version']} through the group")
+            print(f"PASS: clean restore of NuGet.Versioning {gate['version']} through {"direct proxy" if args.direct else "group"}")
         finally:
             if process.poll() is None:
                 subprocess.run(["docker", "stop", "-t", "1", name],

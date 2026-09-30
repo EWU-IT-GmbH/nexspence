@@ -387,6 +387,11 @@ func (h *Handler) fetchAndRewriteNuGetIndex(c *gin.Context, repo *domain.Reposit
 // legacy configuration carried a /v3 suffix (once the only way the index fetch
 // worked), which would double itself onto every already-correct resource path.
 func nugetRemoteOrigin(remoteBase string) string {
+	u, err := url.Parse(remoteBase)
+	if err == nil && u.IsAbs() && u.Host != "" {
+		u.Path, u.RawPath, u.RawQuery, u.Fragment = "", "", "", ""
+		return strings.TrimRight(u.String(), "/")
+	}
 	return strings.TrimSuffix(strings.TrimRight(remoteBase, "/"), "/v3")
 }
 
