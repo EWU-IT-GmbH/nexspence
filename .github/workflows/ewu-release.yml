@@ -1,0 +1,73 @@
+name: EWU build and release
+
+on:
+  push:
+    branches: ['ewu/**']
+    tags: ['v*-ewu.*']
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish a uniquely versioned prerelease and GHCR image
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ewu-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.repository == 'EWU-IT-GmbH/nexspence'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: write
+      packages: write
+    env:
+      NEXSPENCE_IMAGE_REPOSITORY: ghcr.io/ewu-it-gmbh/nexspence
+    steps:
+      - name: Checkout the triggering commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Select version and publication mode
+        id: release
+        run: python3 scripts/release/github_context.py
+      - name: Test release tooling
+        run: python3 -m unittest discover -s scripts/release -p 'test_*.py' -v
+      - name: Set up pinned BuildKit
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e
+        with:
+          version: v0.37.1
+          driver-opts: image=moby/buildkit:v0.33.0@sha256:6c2fa84a6b61ccd72899dde4239f8d5717f05f9a8ca6f3cad185fb1a95a94de3
+      - name: Build twice and record source commit
+        env:
+          EWU_VERSION: ${{ steps.release.outputs.version }}
+        run: python3 scripts/release/build.py --revision "$GITHUB_SHA" --version "$EWU_VERSION" --output "$RUNNER_TEMP/release-output"
+      - name: Log in to GHCR
+        if: steps.release.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+      - name: Publish tagged release metadata and verified OCI image
+        if: steps.release.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EWU_PUBLISH: ${{ steps.release.outputs.publish }}
+          EWU_VERSION: ${{ steps.release.outputs.version }}
+        run: python3 scripts/release/publish.py "$RUNNER_TEMP/release-output"
+      - name: Preserve build evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 30
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/release-output/*.json
+            ${{ runner.temp }}/release-output/*.log
+            ${{ runner.temp }}/release-output/SHA256SUMS

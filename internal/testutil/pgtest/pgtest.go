@@ -7,6 +7,8 @@ package pgtest
 import (
 	"context"
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -48,6 +50,16 @@ func Cleanup() {
 }
 
 func start() {
+	// Interactive client acceptance needs a longer, still bounded safety net.
+	ttl := 600
+	if value := os.Getenv("PGTEST_TTL_SECONDS"); value != "" {
+		seconds, err := strconv.Atoi(value)
+		if err != nil || seconds < 600 || seconds > 7200 {
+			startErr = fmt.Errorf("PGTEST_TTL_SECONDS must be between 600 and 7200")
+			return
+		}
+		ttl = seconds
+	}
 	dpool, err := dockertest.NewPool("")
 	if err != nil {
 		startErr = fmt.Errorf("connect to docker: %w", err)
@@ -75,7 +87,7 @@ func start() {
 		startErr = fmt.Errorf("start postgres container: %w", err)
 		return
 	}
-	_ = resource.Expire(600) // self-destruct after 10m as a safety net
+	_ = resource.Expire(uint(ttl)) // self-destruct even if the runner is interrupted
 
 	hostPort := resource.GetHostPort("5432/tcp")
 	dsn := fmt.Sprintf("postgres://test:test@%s/nexspence_test?sslmode=disable", hostPort)

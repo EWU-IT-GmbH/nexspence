@@ -71,7 +71,7 @@ func TestNuGet_VersionList_Populated(t *testing.T) {
 	repo := testutil.SimpleRepo("pkgs-vl", "nuget")
 	r := setup(repo)
 
-	require.Equal(t, http.StatusCreated, pushNupkg(r, "pkgs-vl", "mypackage.200.nupkg", "data"))
+	require.Equal(t, http.StatusCreated, pushNupkg(r, "pkgs-vl", "mypackage.200.nupkg", string(buildNupkg(t, "mypackage", "200"))))
 
 	req := httptest.NewRequest(http.MethodGet,
 		"/repository/pkgs-vl/v3/flatcontainer/mypackage/index.json", nil)
@@ -89,7 +89,7 @@ func TestNuGet_Push_FileFieldFallback(t *testing.T) {
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
 	part, _ := mw.CreateFormFile("file", "moq.5.nupkg")
-	_, _ = part.Write([]byte("moq-bytes"))
+	_, _ = part.Write(buildNupkg(t, "moq", "5"))
 	mw.Close()
 
 	req := httptest.NewRequest(http.MethodPut, "/repository/pkgs-ff/v2/package", &buf)
