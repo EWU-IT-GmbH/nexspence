@@ -312,6 +312,12 @@ Published on the [Terraform Registry](https://registry.terraform.io/providers/ne
 
 ---
 
+### Public repository listings
+
+In **Repositories → Settings → Anonymous access**, enable **Hide from anonymous repository lists** to omit a repository from signed-out visitors' repository lists. The option is also available when creating a repository. Existing repositories remain listed by default.
+
+For example, hide `hosted-docker-public` and `hosted-nuget-public` while leaving `docker-public` and `nuget-public` listed. Keep **Allow unauthenticated read access** enabled if anonymous clients should still be able to read those repositories. This is a discovery preference, not an access restriction: direct URLs, package downloads, group membership and signed-in users' RBAC permissions are unchanged. The repository create/update API accepts `hideFromAnonymousLists: true` for the same setting.
+
 ## Documentation
 
 Full documentation — deployment variants, HA setup, OIDC SSO, webhooks, the RBAC guide, the OpenAPI spec, and the architecture overview — lives on the website:

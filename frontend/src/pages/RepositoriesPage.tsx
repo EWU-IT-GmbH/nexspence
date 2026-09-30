@@ -18,6 +18,7 @@ interface Repository {
   format: string
   type: string
   online: boolean
+  hideFromAnonymousLists?: boolean
   allowAnonymous: boolean
   description?: string
   cleanupPolicyIds?: string[]
@@ -569,6 +570,7 @@ function CreateRepoModal({ onClose, onCreated }: {
     cleanupPolicyIds: [] as string[],
     quotaGB: '',
     allowAnonymous: false,
+    hideFromAnonymousLists: false,
     blobStoreId: '',
     routingRuleId: '' as string,
     writePolicy: 'allow' as WritePolicy,
@@ -656,6 +658,7 @@ function CreateRepoModal({ onClose, onCreated }: {
         if (!isNaN(gb) && gb > 0) body.quotaBytes = Math.round(gb * 1024 * 1024 * 1024)
       }
       body.allowAnonymous = form.allowAnonymous
+      body.hideFromAnonymousLists = form.hideFromAnonymousLists
       await apiClient.post(`/service/rest/v1/repositories/${form.format}/${form.type}`, body)
       onCreated()
     } catch (err) {
@@ -952,6 +955,11 @@ function CreateRepoModal({ onClose, onCreated }: {
           Allow unauthenticated read access
         </label>
         <span className={styles.hint}>When disabled, only users with an assigned role can read this repository.</span>
+        <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, color: 'var(--holo-text)', cursor: 'pointer' }}>
+          <input type="checkbox" checked={form.hideFromAnonymousLists} onChange={e => setField('hideFromAnonymousLists', e.target.checked)} />
+          Hide from anonymous repository lists
+        </label>
+        <span className={styles.hint}>Hides this repository from signed-out visitors’ lists. Direct links and package downloads still follow the access setting above.</span>
       </div>
     </div>
   )
@@ -1010,6 +1018,7 @@ function EditRepoModal({
   const applicable = cleanupPoliciesForFormat(policies, repo.format)
   const [description, setDescription] = useState(repo.description ?? '')
   const [online, setOnline] = useState(repo.online)
+  const [hideFromAnonymousLists, setHideFromAnonymousLists] = useState(repo.hideFromAnonymousLists ?? false)
   const [allowAnonymous, setAllowAnonymous] = useState(repo.allowAnonymous ?? false)
   const [policyIds, setPolicyIds] = useState<string[]>(repo.cleanupPolicyIds ?? [])
   const [quotaGB, setQuotaGB] = useState(
@@ -1137,7 +1146,7 @@ function EditRepoModal({
 
     setLoading(true)
     try {
-      const updateBody: Record<string, unknown> = { description, online, allowAnonymous, cleanupPolicyIds: policyIds }
+      const updateBody: Record<string, unknown> = { description, online, allowAnonymous, hideFromAnonymousLists, cleanupPolicyIds: policyIds }
       if (quotaGB.trim() !== '') {
         const gb = parseFloat(quotaGB)
         if (!isNaN(gb) && gb > 0) {
@@ -1234,6 +1243,11 @@ function EditRepoModal({
             Allow unauthenticated read access
           </label>
           <span className={styles.hint}>When disabled, only users with an assigned role can read this repository.</span>
+          <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, color: 'var(--holo-text)', cursor: 'pointer' }}>
+            <input type="checkbox" checked={hideFromAnonymousLists} onChange={e => setHideFromAnonymousLists(e.target.checked)} />
+            Hide from anonymous repository lists
+          </label>
+          <span className={styles.hint}>Hides this repository from signed-out visitors’ lists. Direct links and package downloads still follow the access setting above.</span>
         </div>
         <div className={styles.formRow}>
           <label style={LABEL_STYLE}>Description</label>
