@@ -15,12 +15,10 @@
 package nuget
 
 import (
-	"archive/zip"
 	"context"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"path"
@@ -33,13 +31,17 @@ import (
 	"github.com/nexspence-oss/nexspence/internal/formats"
 	"github.com/nexspence-oss/nexspence/internal/formats/base"
 	"github.com/nexspence-oss/nexspence/internal/formats/repoproxy"
+	"github.com/nexspence-oss/nexspence/internal/nugetmeta"
 )
 
 // Handler serves the NuGet v2/v3 repository protocol.
-type Handler struct{ deps formats.Deps }
+type Handler struct {
+	deps   formats.Deps
+	remote *remoteCache
+}
 
 // New creates a NuGet format Handler with the given dependencies.
-func New(deps formats.Deps) *Handler { return &Handler{deps: deps} }
+func New(deps formats.Deps) *Handler { return &Handler{deps: deps, remote: newRemoteCache()} }
 
 // Name returns the format identifier.
 func (h *Handler) Name() string { return "nuget" }
@@ -59,6 +61,10 @@ func (h *Handler) ServeHTTP(c *gin.Context) {
 			h.fetchAndRewriteNuGetIndex(c, repo)
 			return
 		}
+		if p == "/v3/query" || p == "/query" {
+			h.serveProxySearch(c, repo)
+			return
+		}
 		// .nupkg package content is immutable; registration/flat-container index
 		// pages are mutable metadata (new versions appear) and revalidate on a TTL.
 		var maxAge time.Duration
@@ -73,13 +79,47 @@ func (h *Handler) ServeHTTP(c *gin.Context) {
 		if origin := nugetRemoteOrigin(remoteURLOf(repo)); origin != "" {
 			upstreamPath = origin + p
 		}
+		if c.GetString("nugetCallerRepository") != "" && (strings.HasPrefix(p, "/v3/flatcontainer/") || strings.HasPrefix(p, registrationRoot(false)) || strings.HasPrefix(p, registrationRoot(true))) {
+			cached := false
+			if strings.HasSuffix(p, ".nupkg") {
+				a, err := h.deps.Assets.GetByPath(c.Request.Context(), repo.Name, p)
+				cached = err == nil && a != nil
+			}
+			if !cached {
+				var err error
+				upstreamPath, err = groupProxyPath(c.Request.Context(), repo, p)
+				if err != nil {
+					writeQueryError(c, err)
+					return
+				}
+			}
+		}
 		// Registration pages embed absolute upstream URLs (packageContent,
 		// @id) — rewrite them on serve so clients pull packages through this
 		// proxy (#98); the cache keeps the upstream original.
 		var rewrite func([]byte) []byte
-		if strings.HasPrefix(p, "/v3/registration/") {
-			localBase := strings.TrimRight(h.deps.BaseURL, "/") + "/repository/" + repo.Name
+		if strings.HasPrefix(p, "/v3/registration/") || strings.HasPrefix(p, "/v3/registration-semver2/") {
+			caller := repo.Name
+			if groupName := c.GetString("nugetCallerRepository"); groupName != "" {
+				caller = groupName
+			}
+			localBase := strings.TrimRight(h.deps.BaseURL, "/") + "/repository/" + url.PathEscape(caller)
 			rewrite = func(b []byte) []byte { return RewriteRegistration(b, localBase) }
+			if c.GetString("nugetCallerRepository") != "" {
+				rewrite = func(b []byte) []byte {
+					sem2 := strings.HasPrefix(p, registrationRoot(true))
+					remoteRoot := strings.TrimSuffix(upstreamPath, strings.TrimPrefix(p, registrationRoot(sem2)))
+					b = rewriteGroupRegistration(b, localBase, sem2, remoteRoot)
+					if sem2 {
+						compressed, err := gzipJSON(b)
+						if err == nil {
+							c.Header("Content-Encoding", "gzip")
+							return compressed
+						}
+					}
+					return b
+				}
+			}
 		}
 		if err := repoproxy.ServeGETRewritten(c, h.deps, repo, p, upstreamPath, coords, "application/octet-stream", maxAge, rewrite); err != nil {
 			c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
@@ -87,24 +127,32 @@ func (h *Handler) ServeHTTP(c *gin.Context) {
 		return
 	}
 
+	if p == "/v3/query" {
+		if repo == nil {
+			writeQueryError(c, unavailable("search_unavailable"))
+			return
+		}
+		h.serveSearch(c, repo)
+		return
+	}
+	if repo != nil && (c.Request.Method == http.MethodGet || c.Request.Method == http.MethodHead) {
+		if strings.HasPrefix(p, "/v3/registration/") || strings.HasPrefix(p, "/v3/registration-semver2/") {
+			h.serveHostedRegistration(c, repo, p)
+			return
+		}
+		if strings.HasPrefix(p, "/v3/flatcontainer/") && strings.HasSuffix(p, "/index.json") {
+			h.serveHostedVersions(c, repo, p)
+			return
+		}
+		if strings.HasPrefix(p, "/v3/flatcontainer/") && strings.HasSuffix(p, ".nupkg") {
+			h.serveHostedDownload(c, repo, p)
+			return
+		}
+	}
 	switch {
 	// v3 service index
-	case c.Request.Method == http.MethodGet && p == "/index.json":
+	case (c.Request.Method == http.MethodGet || c.Request.Method == http.MethodHead) && p == "/index.json":
 		h.serveIndex(c, repoName)
-
-	// v3 flat container: version list
-	case c.Request.Method == http.MethodGet && strings.HasPrefix(p, "/v3/flatcontainer/") && strings.HasSuffix(p, "/index.json"):
-		pkgID := strings.TrimSuffix(strings.TrimPrefix(p, "/v3/flatcontainer/"), "/index.json")
-		pkgID = strings.Trim(pkgID, "/")
-		h.serveVersionList(c, repoName, pkgID)
-
-	// v3 flat container: download nupkg
-	case c.Request.Method == http.MethodGet && strings.HasPrefix(p, "/v3/flatcontainer/") && strings.HasSuffix(p, ".nupkg"):
-		h.serveFlatContainerDownload(c, repoName, p)
-
-	// v3 registration index
-	case c.Request.Method == http.MethodGet && strings.HasPrefix(p, "/v3/registration/"):
-		h.serveRegistration(c, repoName, p)
 
 	// v2 OData query: FindPackagesById()
 	case c.Request.Method == http.MethodGet && strings.HasPrefix(p, "/FindPackagesById"):
@@ -124,11 +172,35 @@ func (h *Handler) ServeHTTP(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "expected /v2/packages/:id/:version"})
 			return
 		}
-		filePath := "/" + parts[0] + "/" + parts[1] + "/" + parts[0] + "." + parts[1] + ".nupkg"
-		if err := base.DeleteArtifact(c.Request.Context(), h.deps, repoName, filePath); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		version, err := nugetmeta.ParseVersion(parts[1])
+		if err != nil || !nugetmeta.ValidID(parts[0]) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_package_identity"})
 			return
 		}
+		if repo == nil {
+			writeQueryError(c, unavailable("search_unavailable"))
+			return
+		}
+		// The route's RBAC middleware has checked DELETE. Do not require an
+		// unrelated read privilege to resolve equivalent version spellings.
+		scope := SearchScope{Repository: repo, Members: []string{repo.Name}, CanRead: func(string) bool { return true }}
+		ctx, cancel := context.WithTimeout(c.Request.Context(), searchTimeout)
+		defer cancel()
+		records, err := h.exactVersions(ctx, scope, parts[0], true)
+		if err != nil {
+			writeQueryError(c, err)
+			return
+		}
+		for _, record := range records {
+			if record.Metadata.Key == version.Key() {
+				if err := base.DeleteArtifact(ctx, h.deps, repoName, record.Asset.Path); err != nil {
+					writeQueryError(c, err)
+					return
+				}
+				break
+			}
+		}
+
 		c.Status(http.StatusNoContent)
 
 	default:
@@ -137,131 +209,23 @@ func (h *Handler) ServeHTTP(c *gin.Context) {
 }
 
 func (h *Handler) serveIndex(c *gin.Context, repoName string) {
-	base2 := h.deps.BaseURL + "/repository/" + repoName
-	c.JSON(http.StatusOK, gin.H{
+	base2 := strings.TrimRight(h.deps.BaseURL, "/") + "/repository/" + url.PathEscape(repoName)
+	writeNuGetJSON(c, gin.H{
 		"version": "3.0.0",
 		"resources": []gin.H{
+			{"@id": base2 + "/v3/query", "@type": "SearchQueryService"},
+			// NuGet.Protocol discovers search using these versioned aliases.
+			// Do not advertise 3.5.0 until packageType filtering is implemented.
+			{"@id": base2 + "/v3/query", "@type": "SearchQueryService/3.0.0-beta"},
+			{"@id": base2 + "/v3/query", "@type": "SearchQueryService/3.0.0-rc"},
+			{"@id": base2 + "/v3/registration/", "@type": "RegistrationsBaseUrl"},
+			{"@id": base2 + "/v3/registration-semver2/", "@type": "RegistrationsBaseUrl/3.6.0"},
 			{"@id": base2 + "/v3/flatcontainer/", "@type": "PackageBaseAddress/3.0.0"},
 			{"@id": base2 + "/v3/registration/", "@type": "RegistrationsBaseUrl/3.0.0"},
 			{"@id": base2 + "/v2/package", "@type": "PackagePublish/2.0.0"},
 			{"@id": base2 + "/v2/", "@type": "LegacyGallery/2.0.0"},
 		},
-	})
-}
-
-func (h *Handler) serveVersionList(c *gin.Context, repoName, pkgID string) {
-	page, err := h.deps.Components.Search(c.Request.Context(), domain.SearchParams{
-		Repository: repoName, Name: strings.ToLower(pkgID), Limit: 200,
-	})
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	versions := make([]string, 0, len(page.Items))
-	for _, comp := range page.Items {
-		versions = append(versions, comp.Version)
-	}
-	c.JSON(http.StatusOK, gin.H{"versions": versions})
-}
-
-// proxyCoords derives component coordinates for a proxied path. A cached
-// package must carry its real name and version — the OSV/Trivy scan queries
-// by them, so the path-derived fallback name and placeholder version made
-// every package pulled through a NuGet proxy invisible to vulnerability
-// scanning, the same root cause #336 closed for Cargo.
-//
-// A proxy repo forwards whatever local path the client requested straight
-// onto upstream (upstreamPath := origin + p, above) — unlike a hosted repo,
-// it never goes through this file's own "/v3/flatcontainer/" switch-case
-// routes. A real client (nuget.exe, dotnet) requests packages at whatever
-// address the upstream's own index.json/config.json advertised, which for
-// nuget.org and most feeds is "/v3-flatcontainer/" (hyphenated, a sibling of
-// "/v3/", not nested inside it — see TestNuGet_ProxyFlatcontainer_
-// ResolvesAgainstRealShape). Matching on a specific prefix would silently
-// miss that real shape, so this matches by suffix instead: any ".nupkg" path
-// is exactly ":id/:ver/:id.:ver.nupkg" — the same 3-segment split
-// serveFlatContainerDownload already does for hosted downloads, applied to
-// the path's last 3 segments regardless of what comes before them.
-// Registration/index pages are versionless metadata and keep the generic
-// fallback.
-func proxyCoords(p string) base.Coords {
-	if !strings.HasSuffix(p, ".nupkg") {
-		return base.Coords{}
-	}
-	parts := strings.Split(strings.Trim(p, "/"), "/")
-	if len(parts) < 3 {
-		return base.Coords{}
-	}
-	id, ver := parts[len(parts)-3], parts[len(parts)-2]
-	if id == "" || ver == "" {
-		return base.Coords{}
-	}
-	return base.Coords{Name: strings.ToLower(id), Version: ver}
-}
-
-func (h *Handler) serveFlatContainerDownload(c *gin.Context, repoName, p string) {
-	// /v3/flatcontainer/:id/:ver/:id.:ver.nupkg
-	parts := strings.Split(strings.TrimPrefix(p, "/v3/flatcontainer/"), "/")
-	if len(parts) < 3 {
-		c.JSON(http.StatusNotFound, gin.H{"error": "invalid nupkg path"})
-		return
-	}
-	pkgID, version := parts[0], parts[1]
-	filePath := "/" + pkgID + "/" + version + "/" + pkgID + "." + version + ".nupkg"
-
-	rc, asset, err := base.FetchArtifact(c.Request.Context(), h.deps, repoName, filePath)
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
-		return
-	}
-	defer func() { _ = rc.Close() }()
-	c.DataFromReader(http.StatusOK, asset.SizeBytes, "application/zip", rc, nil)
-}
-
-func (h *Handler) serveRegistration(c *gin.Context, repoName, p string) {
-	// /v3/registration/:id/index.json
-	rest := strings.TrimPrefix(p, "/v3/registration/")
-	pkgID := strings.TrimSuffix(rest, "/index.json")
-	pkgID = strings.Trim(pkgID, "/")
-
-	page, err := h.deps.Components.Search(c.Request.Context(), domain.SearchParams{
-		Repository: repoName, Name: strings.ToLower(pkgID), Limit: 200,
-	})
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	if len(page.Items) == 0 {
-		c.JSON(http.StatusNotFound, gin.H{"error": "package not found"})
-		return
-	}
-
-	base2 := h.deps.BaseURL + "/repository/" + repoName
-	items := make([]gin.H, 0, len(page.Items))
-	for _, comp := range page.Items {
-		entryURL := base2 + "/v3/registration/" + pkgID + "/" + comp.Version + ".json"
-		items = append(items, gin.H{
-			"@id":            entryURL,
-			"packageContent": base2 + "/v3/flatcontainer/" + pkgID + "/" + comp.Version + "/" + pkgID + "." + comp.Version + ".nupkg",
-			"catalogEntry": gin.H{
-				"id":        comp.Name,
-				"version":   comp.Version,
-				"listed":    true,
-				"published": comp.CreatedAt.UTC().Format(time.RFC3339),
-			},
-		})
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"@id":   base2 + "/v3/registration/" + pkgID + "/index.json",
-		"count": 1,
-		"items": []gin.H{{
-			"count": len(items),
-			"items": items,
-			"lower": page.Items[0].Version,
-			"upper": page.Items[len(page.Items)-1].Version,
-		}},
-	})
+	}, false)
 }
 
 // OData v2 compatible FindPackagesById response
@@ -282,24 +246,27 @@ type content struct {
 }
 
 func (h *Handler) serveFindPackages(c *gin.Context, repoName, pkgID string) {
-	page, err := h.deps.Components.Search(c.Request.Context(), domain.SearchParams{
-		Repository: repoName, Name: strings.ToLower(pkgID), Limit: 200,
-	})
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+	repo, err := h.deps.Repos.Get(c.Request.Context(), repoName)
+	if err != nil || repo == nil {
+		writeQueryError(c, unavailable("search_unavailable"))
 		return
 	}
-	base2 := h.deps.BaseURL + "/repository/" + repoName
+	scope, err := h.readScope(c, repo)
+	defer finishRead(c)
+	if err != nil {
+		writeQueryError(c, err)
+		return
+	}
+	records, err := h.exactVersions(c.Request.Context(), scope, pkgID, false)
+	if err != nil {
+		writeQueryError(c, err)
+		return
+	}
+	prefix := strings.TrimRight(h.deps.BaseURL, "/") + "/repository/" + url.PathEscape(scope.Repository.Name)
 	f := feed{XMLNS: "http://www.w3.org/2005/Atom"}
-	for _, comp := range page.Items {
-		f.Entries = append(f.Entries, entry{
-			Title: comp.Name + " " + comp.Version,
-			ID:    base2 + "/v2/Packages(Id='" + comp.Name + "',Version='" + comp.Version + "')",
-			Content: content{
-				Type: "application/zip",
-				Src:  base2 + "/v3/flatcontainer/" + strings.ToLower(comp.Name) + "/" + comp.Version + "/" + strings.ToLower(comp.Name) + "." + comp.Version + ".nupkg",
-			},
-		})
+	for _, r := range records {
+		m := r.Metadata
+		f.Entries = append(f.Entries, entry{Title: m.ID + " " + m.Version, ID: prefix + "/v2/Packages(Id='" + m.ID + "',Version='" + m.Version + "')", Content: content{Type: "application/zip", Src: prefix + packagePaths(m.ID, m.Key, false)[1]}})
 	}
 	c.Header("Content-Type", "application/atom+xml; charset=utf-8")
 	c.XML(http.StatusOK, f)
@@ -309,6 +276,9 @@ func (h *Handler) handlePush(c *gin.Context, repoName string) {
 	if err := c.Request.ParseMultipartForm(64 << 20); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
+	}
+	if c.Request.MultipartForm != nil {
+		defer c.Request.MultipartForm.RemoveAll()
 	}
 	f, fh, err := c.Request.FormFile("package")
 	if err != nil {
@@ -321,10 +291,15 @@ func (h *Handler) handlePush(c *gin.Context, repoName string) {
 	}
 	defer func() { _ = f.Close() }()
 
-	pkgID, version := nupkgCoords(f, fh.Size, fh.Filename)
+	meta, err := nugetmeta.Read(f, fh.Size)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_nupkg"})
+		return
+	}
+	pkgID, version := meta.ID, meta.Key
 	filePath := "/" + pkgID + "/" + version + "/" + pkgID + "." + version + ".nupkg"
 
-	coords := base.Coords{Name: pkgID, Version: version}
+	coords := base.Coords{Name: pkgID, Version: version, Extra: map[string]any{"nuget": meta}}
 	if _, err := base.StoreArtifact(c.Request.Context(), h.deps,
 		repoName, filePath, "application/zip", coords, f, fh.Size); err != nil {
 		c.JSON(base.HTTPStatusForError(err), gin.H{"error": err.Error()})
@@ -333,52 +308,11 @@ func (h *Handler) handlePush(c *gin.Context, repoName string) {
 	c.Status(http.StatusCreated)
 }
 
-// nuspecMeta is the subset of the .nuspec manifest needed for coordinates.
-type nuspecMeta struct {
-	Metadata struct {
-		ID      string `xml:"id"`
-		Version string `xml:"version"`
-	} `xml:"metadata"`
-}
-
-// nupkgCoords resolves the package id and version for an uploaded .nupkg.
-// The .nuspec inside the archive is authoritative; the filename is a fallback
-// (version = the trailing dot-separated parts starting at the first digit-led
-// part, so "Newtonsoft.Json.13.0.1" → id "newtonsoft.json", version "13.0.1"
-// — a naive last-dot split corrupts real semver coordinates, #100).
-func nupkgCoords(f io.ReaderAt, size int64, filename string) (string, string) {
-	if zr, err := zip.NewReader(f, size); err == nil {
-		for _, zf := range zr.File {
-			if !strings.HasSuffix(zf.Name, ".nuspec") || strings.Contains(zf.Name, "/") {
-				continue
-			}
-			rc, err := zf.Open()
-			if err != nil {
-				continue
-			}
-			var meta nuspecMeta
-			err = xml.NewDecoder(io.LimitReader(rc, 1<<20)).Decode(&meta)
-			_ = rc.Close()
-			if err == nil && meta.Metadata.ID != "" && meta.Metadata.Version != "" {
-				return strings.ToLower(meta.Metadata.ID), meta.Metadata.Version
-			}
-		}
-	}
-	name := strings.TrimSuffix(filename, ".nupkg")
-	parts := strings.Split(name, ".")
-	for i := 1; i < len(parts); i++ {
-		if parts[i] != "" && parts[i][0] >= '0' && parts[i][0] <= '9' {
-			return strings.ToLower(strings.Join(parts[:i], ".")), strings.Join(parts[i:], ".")
-		}
-	}
-	return strings.ToLower(name), "0.0.0"
-}
-
 // fetchAndRewriteNuGetIndex fetches the NuGet v3 service index from upstream,
 // rewrites all resource @id URLs to point to this proxy, and returns the result.
 // Not cached — fetched live so new resource endpoints appear promptly.
 func (h *Handler) fetchAndRewriteNuGetIndex(c *gin.Context, repo *domain.Repository) {
-	remoteBase, err := repoproxy.RemoteURL(repo)
+	indexURL, err := nugetServiceIndexURL(repo)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -387,12 +321,8 @@ func (h *Handler) fetchAndRewriteNuGetIndex(c *gin.Context, repo *domain.Reposit
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
 	defer cancel()
 
-	// The v3 service index is the ONE fixed path in an otherwise fully
-	// discoverable protocol, and it lives at /v3/index.json on the real
-	// nuget.org (#349). remote_url is the bare origin; a legacy /v3-suffixed
-	// value is normalized so it neither breaks discovery nor doubles itself
-	// onto the resource paths the index advertises.
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, nugetRemoteOrigin(remoteBase)+"/v3/index.json", nil)
+	// Honor explicitly configured service-index paths as well as bare origins.
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, indexURL, nil)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid upstream URL: " + err.Error()})
 		return
@@ -437,6 +367,12 @@ func (h *Handler) fetchAndRewriteNuGetIndex(c *gin.Context, repo *domain.Reposit
 				continue
 			}
 			res["@id"] = localBase + parsed.RequestURI()
+			for _, kind := range searchResourceTypes {
+				if res["@type"] == kind {
+					res["@id"] = localBase + "/v3/query"
+					break
+				}
+			}
 		}
 	}
 
@@ -451,6 +387,11 @@ func (h *Handler) fetchAndRewriteNuGetIndex(c *gin.Context, repo *domain.Reposit
 // legacy configuration carried a /v3 suffix (once the only way the index fetch
 // worked), which would double itself onto every already-correct resource path.
 func nugetRemoteOrigin(remoteBase string) string {
+	u, err := url.Parse(remoteBase)
+	if err == nil && u.IsAbs() && u.Host != "" {
+		u.Path, u.RawPath, u.RawQuery, u.Fragment = "", "", "", ""
+		return strings.TrimRight(u.String(), "/")
+	}
 	return strings.TrimSuffix(strings.TrimRight(remoteBase, "/"), "/v3")
 }
 
@@ -465,4 +406,39 @@ func remoteURLOf(repo *domain.Repository) string {
 
 func normPath(p string) string {
 	return path.Clean("/" + strings.TrimPrefix(p, "/"))
+}
+
+// proxyCoords derives component coordinates for a proxied path. A cached
+// package must carry its real name and version — the OSV/Trivy scan queries
+// by them, so the path-derived fallback name and placeholder version made
+// every package pulled through a NuGet proxy invisible to vulnerability
+// scanning, the same root cause #336 closed for Cargo.
+//
+// A proxy repo forwards whatever local path the client requested straight
+// onto upstream (upstreamPath := origin + p, above) — unlike a hosted repo,
+// it never goes through this file's own "/v3/flatcontainer/" switch-case
+// routes. A real client (nuget.exe, dotnet) requests packages at whatever
+// address the upstream's own index.json/config.json advertised, which for
+// nuget.org and most feeds is "/v3-flatcontainer/" (hyphenated, a sibling of
+// "/v3/", not nested inside it — see TestNuGet_ProxyFlatcontainer_
+// ResolvesAgainstRealShape). Matching on a specific prefix would silently
+// miss that real shape, so this matches by suffix instead: any ".nupkg" path
+// is exactly ":id/:ver/:id.:ver.nupkg" — the same 3-segment split
+// serveFlatContainerDownload already does for hosted downloads, applied to
+// the path's last 3 segments regardless of what comes before them.
+// Registration/index pages are versionless metadata and keep the generic
+// fallback.
+func proxyCoords(p string) base.Coords {
+	if !strings.HasSuffix(p, ".nupkg") {
+		return base.Coords{}
+	}
+	parts := strings.Split(strings.Trim(p, "/"), "/")
+	if len(parts) < 3 {
+		return base.Coords{}
+	}
+	id, ver := parts[len(parts)-3], parts[len(parts)-2]
+	if id == "" || ver == "" {
+		return base.Coords{}
+	}
+	return base.Coords{Name: strings.ToLower(id), Version: ver}
 }

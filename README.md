@@ -20,6 +20,18 @@
 
 </div>
 
+## EWU NuGet-search fork
+
+This is the [EWU fork](https://github.com/EWU-IT-GmbH/nexspence), based on upstream
+**v2.9.0**, with NuGet search and registration changes. Maintenance:
+EWU-Infrastruktur-Team. The upstream overview and deployment examples below
+remain upstream documentation; they do not select the EWU image.
+
+See [BUILDING-EWU.md](BUILDING-EWU.md) for the EWU build and release workflow.
+GitHub Actions builds the private image `ghcr.io/ewu-it-gmbh/nexspence`; release
+metadata identifies its digest and matching public source tag/commit. No separate
+source archive is generated. The workflow does not deploy the service.
+
 ---
 
 ## 🎬 Demo
@@ -385,11 +397,16 @@ cd frontend && npm run lint
 `AGPL-3.0-or-later` — the full text is in [LICENSE](LICENSE), the copyright and
 third-party notices in [NOTICE](NOTICE).
 
-AGPL rather than a permissive licence for one reason: Nexspence is a network
-service, and §13 is what keeps a hosted fork from being closed off. Running it
-inside your company, however you like, needs nothing from you — the obligation
-only starts if you offer a modified Nexspence to others over a network, and then
-it is to publish those modifications.
+This checkout is the EWU NuGet-search variant of Nexspence v2.9.0, modified
+2026-09-29 to 2026-09-30. It remains licensed under AGPL-3.0-or-later.
+See [BUILDING-EWU.md](BUILDING-EWU.md) for retained build instructions and
+source-delivery requirements, and [NOTICE](NOTICE) for modification notices.
+
+For a modified network service, AGPL section 13 requires a prominent offer of
+the corresponding source of that version to all users interacting with it
+remotely. Internal hosting is not a blanket exemption from that requirement.
+Image distribution also requires attention to section 6. A link to an
+inaccessible private repository does not fulfill the offer to those users.
 
 Contributions are accepted under the same licence, with no CLA and no sign-off
 to remember — see [CONTRIBUTING.md](CONTRIBUTING.md).

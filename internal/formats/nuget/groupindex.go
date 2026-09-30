@@ -1,66 +1,110 @@
 package nuget
 
-// Group index merging (#99 phase 2): the flatcontainer version list answers
-// 200 with {"versions":[]} for unknown packages, which under first-non-404
-// fan-out shadowed every member behind the first; the service index embeds
-// member-scoped URLs. Registration is NOT merged this phase — it 404s on
-// miss, so plain fan-out reaches the right member.
-
 import (
-	"encoding/json"
-	"fmt"
+	"context"
+	"net/http"
 	"strings"
 
+	"github.com/gin-gonic/gin"
+	"github.com/nexspence-oss/nexspence/internal/domain"
 	"github.com/nexspence-oss/nexspence/internal/formats"
+	"github.com/nexspence-oss/nexspence/internal/repository"
 )
 
-// GroupIndexSourcePath implements formats.GroupIndexMerger.
-func (h *Handler) GroupIndexSourcePath(p string) (string, bool) {
+var _ formats.GroupRequestHandler = (*Handler)(nil)
+
+// ServeGroup handles local v3 resources without invoking each member's HTTP
+// handler. Only explicit reads absent from the local catalog may reach proxies.
+func (h *Handler) ServeGroup(c *gin.Context, repo *domain.Repository, fallback func([]string)) bool {
+	p := normPath(c.Param("path"))
+	if p != "/v3/query" && p != "/index.json" && !strings.HasPrefix(p, "/v3/registration/") && !strings.HasPrefix(p, "/v3/registration-semver2/") && !strings.HasPrefix(p, "/v3/flatcontainer/") {
+		return false
+	}
+	if c.Request.Method != http.MethodGet && c.Request.Method != http.MethodHead {
+		c.Header("Allow", "GET, HEAD")
+		writeQueryError(c, &queryError{405, "method_not_allowed"})
+		return true
+	}
+	c.Set("nugetProxyFallback", fallback)
 	if p == "/index.json" {
-		return p, true
+		ctx, cancel := context.WithTimeout(c.Request.Context(), searchTimeout)
+		defer cancel()
+		c.Request = c.Request.WithContext(ctx)
+		scope, err := h.hostedScope(c, repo)
+		if err != nil {
+			writeQueryError(c, err)
+			return true
+		}
+		if !scope.CanRead(p) {
+			writeQueryError(c, &queryError{403, "access_denied"})
+			return true
+		}
+		h.serveIndex(c, repo.Name)
+	} else {
+		h.ServeHTTP(c)
 	}
-	if strings.HasPrefix(p, "/v3/flatcontainer/") && strings.HasSuffix(p, "/index.json") {
-		return p, true
-	}
-	return "", false
+	return true
 }
 
-// MergeGroupIndex implements formats.GroupIndexMerger.
-func (h *Handler) MergeGroupIndex(groupName, p string, parts []formats.GroupIndexPart) ([]byte, string, error) {
-	if p == "/index.json" {
-		// Service index: first member's document re-rooted at the group —
-		// the resource shapes are identical across members.
-		body := strings.ReplaceAll(string(parts[0].Body),
-			"/repository/"+parts[0].Member+"/", "/repository/"+groupName+"/")
-		return []byte(body), "application/json", nil
+// fallbackGroup never lets an invisible local package be replaced by a remote
+// copy. This also prevents a SemVer1 request from exposing a lower-priority copy
+// of a local SemVer2 package. Errors remain errors, never empty successful reads.
+func (h *Handler) fallbackGroup(c *gin.Context, scope SearchScope, id, key string) bool {
+	v, ok := c.Get("nugetProxyFallback")
+	if !ok || len(scope.Proxies) == 0 {
+		return false
 	}
-
-	// Flatcontainer version list: union across members, member order.
-	var out []string
-	seen := map[string]bool{}
-	parsed := false
-	for _, part := range parts {
-		var doc struct {
-			Versions []string `json:"versions"`
-		}
-		if err := json.Unmarshal(part.Body, &doc); err != nil {
-			continue // malformed member copy — merge the rest
-		}
-		parsed = true
-		for _, v := range doc.Versions {
-			if v == "" || seen[v] {
-				continue
+	found := false
+	err := h.deps.NuGet.Snapshot(c.Request.Context(), func(s repository.NuGetSnapshot) error {
+		return s.Walk(c.Request.Context(), repository.NuGetQuery{Repositories: scope.Members, ExactID: strings.ToLower(id)}, func(candidate repository.NuGetCandidate) error {
+			if key == "" || candidate.Key == key {
+				found = true
 			}
-			seen[v] = true
-			out = append(out, v)
+			return nil
+		})
+	})
+	if err != nil {
+		writeQueryError(c, err)
+		return true
+	}
+	if found {
+		return false
+	}
+	if !scope.CanRead(normPath(c.Param("path"))) {
+		writeQueryError(c, &queryError{403, "access_denied"})
+		return true
+	}
+	if key != "" {
+		proxies, err := h.proxyRepositories(c.Request.Context(), scope)
+		if err != nil {
+			writeQueryError(c, err)
+			return true
 		}
+		for _, proxy := range proxies {
+			// Immutable cached bytes remain usable without an upstream metadata request.
+			asset, assetErr := h.deps.Assets.GetByPath(c.Request.Context(), proxy.Name, normPath(c.Param("path")))
+			selected := assetErr == nil && asset != nil
+			if !selected {
+				records, err := h.remoteRegistration(c.Request.Context(), proxy, scope.Caller, id)
+				if err != nil {
+					writeQueryError(c, err)
+					return true
+				}
+				for _, record := range records {
+					if record.Metadata.Key == key {
+						selected = true
+						break
+					}
+				}
+			}
+			if selected {
+				c.Set("nugetExpectedRemoteVersion", proxy.Name)
+				v.(func([]string))([]string{proxy.Name})
+				return true
+			}
+		}
+		return false
 	}
-	if !parsed {
-		return nil, "", fmt.Errorf("nuget group merge: no parsable version list among %d members", len(parts))
-	}
-	if out == nil {
-		out = []string{}
-	}
-	body, err := json.Marshal(map[string]any{"versions": out})
-	return body, "application/json", err
+	v.(func([]string))(scope.Proxies)
+	return true
 }
