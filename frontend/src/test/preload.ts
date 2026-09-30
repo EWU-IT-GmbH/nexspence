@@ -35,3 +35,30 @@ if (typeof globalThis.localStorage === 'undefined' ||
     } satisfies Storage,
   })
 }
+
+// jsdom's Blob supports FileReader but lacks stream(). MSW's XHR interceptor
+// passes blob responses to Node's native Response, which requires that method.
+// Keep jsdom's Blob/File constructors so DOM uploads and FileReader still work.
+if (typeof Blob.prototype.stream !== 'function') {
+  Object.defineProperty(Blob.prototype, 'stream', {
+    configurable: true,
+    writable: true,
+    value(this: Blob): ReadableStream<Uint8Array> {
+      let reader: FileReader
+      return new ReadableStream<Uint8Array>({
+        start: (controller) => {
+          reader = new FileReader()
+          reader.onload = () => {
+            controller.enqueue(new Uint8Array(reader.result as ArrayBuffer))
+            controller.close()
+          }
+          reader.onerror = () => controller.error(reader.error)
+          reader.readAsArrayBuffer(this)
+        },
+        cancel() {
+          reader.abort()
+        },
+      })
+    },
+  })
+}
