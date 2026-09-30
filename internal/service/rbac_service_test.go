@@ -761,3 +761,29 @@ func TestRBAC_AssetSamplePath_StoredShapeUnchanged(t *testing.T) {
 	got := svc.FilterAssets(context.Background(), "user1", nil, items, nil)
 	assert.Len(t, got, 2)
 }
+
+func TestRBAC_ReadPolicySnapshotMatchesPathChecks(t *testing.T) {
+	ctx := context.Background()
+	repo := &domain.Repository{Name: "hosted", Format: "nuget"}
+	privs := []repository.PrivilegeWithSelector{
+		{Actions: []string{"read"}, Expression: `repository == "hosted" && path.startsWith("/v3/flatcontainer/public/")`},
+		{Actions: []string{"read"}, Expression: `repository == "hosted" && path.startsWith("/v3/query")`},
+	}
+	svc := newRBACTestSvc(privs, repo)
+	for _, caller := range []struct {
+		id    string
+		roles []string
+	}{{"reader", nil}, {"", nil}, {"admin", []string{"nx-admin"}}} {
+		policy, e := svc.SnapshotReadPolicy(ctx, caller.id, caller.roles, repo)
+		require.NoError(t, e)
+		for _, path := range []string{"/v3/query", "/v3/flatcontainer/public/index.json", "/v3/flatcontainer/secret/1.0.0/secret.1.0.0.nupkg", "/v3/registration/public/index.json"} {
+			allowed, e := svc.CanAccessRepo(ctx, caller.id, caller.roles, repo, path, "read")
+			require.NoError(t, e)
+			require.Equal(t, allowed, policy(path), path)
+		}
+	}
+	svc = newRBACTestSvcWithErr(errors.New("database unavailable"))
+	policy, e := svc.SnapshotReadPolicy(ctx, "reader", nil, repo)
+	require.Error(t, e)
+	require.Nil(t, policy)
+}

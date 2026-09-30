@@ -17,6 +17,8 @@ import (
 	"github.com/nexspence-oss/nexspence/internal/domain"
 	"github.com/nexspence-oss/nexspence/internal/formats"
 	"github.com/nexspence-oss/nexspence/internal/formats/nuget"
+	"github.com/nexspence-oss/nexspence/internal/logger"
+	"github.com/nexspence-oss/nexspence/internal/service"
 	"github.com/nexspence-oss/nexspence/internal/testutil"
 )
 
@@ -31,9 +33,11 @@ func setup(repo *domain.Repository) *gin.Engine {
 		BlobStore:  testutil.NewBlobStore(),
 		BaseURL:    "http://localhost:8080",
 	}
+	d.NuGet = &testutil.NuGetCatalog{Components: d.Components.(*testutil.ComponentRepo), Assets: d.Assets.(*testutil.AssetRepo)}
+	d.RBAC = service.NewRBACService(nil, d.Repos, logger.New("error", "json"), true)
 	h := nuget.New(d)
 	r := gin.New()
-	r.Any("/repository/:repoName/*path", func(c *gin.Context) { h.ServeHTTP(c) })
+	r.Any("/repository/:repoName/*path", func(c *gin.Context) { c.Set("userID", "admin"); c.Set("roles", []string{"nx-admin"}); h.ServeHTTP(c) })
 	return r
 }
 
@@ -60,6 +64,8 @@ func TestNuGet_ServiceIndex(t *testing.T) {
 	r.ServeHTTP(w, req)
 	assert.Equal(t, http.StatusOK, w.Code)
 	assert.Contains(t, w.Body.String(), "PackageBaseAddress")
+	assert.Contains(t, w.Body.String(), `"@type":"SearchQueryService/3.0.0-beta"`)
+	assert.Contains(t, w.Body.String(), `"@type":"SearchQueryService/3.0.0-rc"`)
 	assert.Contains(t, w.Body.String(), "3.0.0")
 }
 
@@ -68,14 +74,14 @@ func TestNuGet_PushAndDownload(t *testing.T) {
 	r := setup(repo)
 
 	// filename = id.version.nupkg — handler splits at last dot, so use single-segment version
-	require.Equal(t, http.StatusCreated, pushNupkg(r, "pkgs2", "mylib.1.nupkg", "nupkg-bytes"))
+	require.Equal(t, http.StatusCreated, pushNupkg(r, "pkgs2", "mylib.1.nupkg", string(buildNupkg(t, "mylib", "1"))))
 
 	req := httptest.NewRequest(http.MethodGet,
-		"/repository/pkgs2/v3/flatcontainer/mylib/1/mylib.1.nupkg", nil)
+		"/repository/pkgs2/v3/flatcontainer/mylib/1.0.0/mylib.1.0.0.nupkg", nil)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	assert.Equal(t, http.StatusOK, w.Code)
-	assert.Equal(t, "nupkg-bytes", w.Body.String())
+	assert.Equal(t, buildNupkg(t, "mylib", "1"), w.Body.Bytes())
 }
 
 func TestNuGet_VersionList_Empty(t *testing.T) {
@@ -95,7 +101,7 @@ func TestNuGet_VersionList_AfterPush(t *testing.T) {
 	r := setup(repo)
 
 	// serilog.311.nupkg → id=serilog, version=311 (single-segment to avoid last-dot splitting ambiguity)
-	require.Equal(t, http.StatusCreated, pushNupkg(r, "pkgs4", "serilog.311.nupkg", "serilog-bytes"))
+	require.Equal(t, http.StatusCreated, pushNupkg(r, "pkgs4", "serilog.311.nupkg", string(buildNupkg(t, "serilog", "311"))))
 
 	req := httptest.NewRequest(http.MethodGet,
 		"/repository/pkgs4/v3/flatcontainer/serilog/index.json", nil)
@@ -110,7 +116,7 @@ func TestNuGet_Registration(t *testing.T) {
 	r := setup(repo)
 
 	// newtonsoft.json.1301.nupkg → id=newtonsoft.json, version=1301
-	require.Equal(t, http.StatusCreated, pushNupkg(r, "pkgs5", "newtonsoft.json.1301.nupkg", "nj-bytes"))
+	require.Equal(t, http.StatusCreated, pushNupkg(r, "pkgs5", "newtonsoft.json.1301.nupkg", string(buildNupkg(t, "newtonsoft.json", "1301"))))
 
 	req := httptest.NewRequest(http.MethodGet,
 		"/repository/pkgs5/v3/registration/newtonsoft.json/index.json", nil)
@@ -126,7 +132,7 @@ func TestNuGet_FindPackagesById(t *testing.T) {
 	r := setup(repo)
 
 	// castle.core.5.nupkg → id=castle.core, version=5
-	require.Equal(t, http.StatusCreated, pushNupkg(r, "pkgs6", "castle.core.5.nupkg", "castle-bytes"))
+	require.Equal(t, http.StatusCreated, pushNupkg(r, "pkgs6", "castle.core.5.nupkg", string(buildNupkg(t, "castle.core", "5"))))
 
 	req := httptest.NewRequest(http.MethodGet,
 		"/repository/pkgs6/FindPackagesById()?id='Castle.Core'", nil)
@@ -140,13 +146,17 @@ func TestNuGet_Delete(t *testing.T) {
 	repo := testutil.SimpleRepo("pkgs7", "nuget")
 	r := setup(repo)
 
-	require.Equal(t, http.StatusCreated, pushNupkg(r, "pkgs7", "autofac.7.nupkg", "autofac-bytes"))
+	require.Equal(t, http.StatusCreated, pushNupkg(r, "pkgs7", "autofac.7.nupkg", string(buildNupkg(t, "autofac", "7"))))
 
 	req := httptest.NewRequest(http.MethodDelete,
 		"/repository/pkgs7/v2/packages/autofac/7", nil)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	assert.Equal(t, http.StatusNoContent, w.Code)
+	w = httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/repository/pkgs7/v3/flatcontainer/autofac/7.0.0/autofac.7.0.0.nupkg", nil))
+	assert.Equal(t, http.StatusNotFound, w.Code)
+
 }
 
 func TestNuGet_ProxyRejectMutation(t *testing.T) {
@@ -331,23 +341,13 @@ func buildNupkg(t *testing.T, id, version string) []byte {
 	return buf.Bytes()
 }
 
-func TestNuGet_Push_SemverFilename_Heuristic(t *testing.T) {
-	// Regression for #100: non-zip body falls back to filename parsing.
-	// The version must be the trailing digit-led parts, not just the
-	// last dot segment.
+func TestNuGet_Push_RejectsFilenameOnlyMetadata(t *testing.T) {
 	repo := testutil.SimpleRepo("pkgs-semver", "nuget")
 	r := setup(repo)
-
-	require.Equal(t, http.StatusCreated,
-		pushNupkg(r, "pkgs-semver", "Newtonsoft.Json.13.0.1.nupkg", "fake-bytes"))
-
-	req := httptest.NewRequest(http.MethodGet,
-		"/repository/pkgs-semver/v3/flatcontainer/newtonsoft.json/13.0.1/newtonsoft.json.13.0.1.nupkg", nil)
+	require.Equal(t, http.StatusBadRequest, pushNupkg(r, "pkgs-semver", "Newtonsoft.Json.13.0.1.nupkg", "fake-bytes"))
 	w := httptest.NewRecorder()
-	r.ServeHTTP(w, req)
-	assert.Equal(t, http.StatusOK, w.Code,
-		"stored coordinates must be id=newtonsoft.json version=13.0.1")
-	assert.Equal(t, "fake-bytes", w.Body.String())
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/repository/pkgs-semver/v3/flatcontainer/newtonsoft.json/13.0.1/newtonsoft.json.13.0.1.nupkg", nil))
+	require.Equal(t, http.StatusNotFound, w.Code)
 }
 
 func TestNuGet_Push_NuspecAuthoritative(t *testing.T) {
