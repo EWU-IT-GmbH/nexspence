@@ -84,7 +84,8 @@ func TestRepositoryRepo_Create_FieldsRoundTrip(t *testing.T) {
 		FormatConfig: map[string]any{
 			"version_policy": "release",
 		},
-		AllowAnonymous: true,
+		AllowAnonymous:         true,
+		HideFromAnonymousLists: true,
 	}
 	if err := repo.Create(ctx, r); err != nil {
 		t.Fatalf("Create: %v", err)
@@ -114,6 +115,9 @@ func TestRepositoryRepo_Create_FieldsRoundTrip(t *testing.T) {
 	}
 	if !got.Online {
 		t.Error("Online: got false, want true")
+	}
+	if !got.HideFromAnonymousLists {
+		t.Error("HideFromAnonymousLists: got false, want true")
 	}
 	if !got.AllowAnonymous {
 		t.Error("AllowAnonymous: got false, want true")

@@ -39,6 +39,17 @@ func (h *RepositoryHandler) List(c *gin.Context) {
 	repos = h.rbacSvc.FilterRepos(c.Request.Context(),
 		stringVal(userID), stringSliceVal(roles), repos)
 
+	// Listing visibility is independent of artifact read access. Signed-in users
+	// retain their RBAC-filtered list, including repositories hidden from guests.
+	if stringVal(userID) == "" {
+		listed := make([]domain.Repository, 0, len(repos))
+		for _, repo := range repos {
+			if !repo.HideFromAnonymousLists {
+				listed = append(listed, repo)
+			}
+		}
+		repos = listed
+	}
 	c.JSON(http.StatusOK, domain.RedactedRepositories(repos))
 }
 
@@ -147,8 +158,9 @@ func (h *RepositoryHandler) Patch(c *gin.Context) {
 		return
 	}
 	r, err := h.svc.Update(c.Request.Context(), name, &domain.Repository{
-		Online:         body.Online,
-		AllowAnonymous: existing.AllowAnonymous,
+		Online:                 body.Online,
+		AllowAnonymous:         existing.AllowAnonymous,
+		HideFromAnonymousLists: existing.HideFromAnonymousLists,
 	})
 	if err != nil {
 		if isNotFound(err) {

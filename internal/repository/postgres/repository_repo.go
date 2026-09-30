@@ -26,7 +26,7 @@ func NewRepositoryRepo(db *pgxpool.Pool) *repositoryRepo {
 func (r *repositoryRepo) List(ctx context.Context, format, repoType string) ([]domain.Repository, error) {
 	query := `SELECT id, name, format, type, blob_store_id, online,
 	                 format_config, http_config, proxy_config, cleanup_policy_ids,
-	                 quota_bytes, routing_rule_id, allow_anonymous, description, created_at, updated_at
+	                 quota_bytes, routing_rule_id, allow_anonymous, hide_from_anonymous_lists, description, created_at, updated_at
 	          FROM repositories WHERE 1=1`
 	args := []any{}
 	i := 1
@@ -63,7 +63,7 @@ func (r *repositoryRepo) Get(ctx context.Context, name string) (*domain.Reposito
 	row := r.db.QueryRow(ctx, `
 		SELECT id, name, format, type, blob_store_id, online,
 		       format_config, http_config, proxy_config, cleanup_policy_ids,
-		       quota_bytes, routing_rule_id, allow_anonymous, description, created_at, updated_at
+		       quota_bytes, routing_rule_id, allow_anonymous, hide_from_anonymous_lists, description, created_at, updated_at
 		FROM repositories WHERE name = $1`, name)
 	repo, err := scanRepository(row)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -76,7 +76,7 @@ func (r *repositoryRepo) GetByID(ctx context.Context, id string) (*domain.Reposi
 	row := r.db.QueryRow(ctx, `
 		SELECT id, name, format, type, blob_store_id, online,
 		       format_config, http_config, proxy_config, cleanup_policy_ids,
-		       quota_bytes, routing_rule_id, allow_anonymous, description, created_at, updated_at
+		       quota_bytes, routing_rule_id, allow_anonymous, hide_from_anonymous_lists, description, created_at, updated_at
 		FROM repositories WHERE id = $1`, id)
 	repo, err := scanRepository(row)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -93,13 +93,13 @@ func (r *repositoryRepo) Create(ctx context.Context, repo *domain.Repository) er
 	return r.db.QueryRow(ctx, `
 		INSERT INTO repositories
 		  (name, format, type, blob_store_id, online, format_config, http_config,
-		   proxy_config, cleanup_policy_ids, quota_bytes, routing_rule_id, allow_anonymous, description)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+		   proxy_config, cleanup_policy_ids, quota_bytes, routing_rule_id, allow_anonymous, hide_from_anonymous_lists, description)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
 		RETURNING id, created_at, updated_at`,
 		repo.Name, repo.Format, repo.Type, repo.BlobStoreID, repo.Online,
 		fmtCfg, httpCfg, proxyCfg,
 		policyIDsToStrings(repo.CleanupPolicyIDs),
-		repo.QuotaBytes, repo.RoutingRuleID, repo.AllowAnonymous, repo.Description,
+		repo.QuotaBytes, repo.RoutingRuleID, repo.AllowAnonymous, repo.HideFromAnonymousLists, repo.Description,
 	).Scan(&repo.ID, &repo.CreatedAt, &repo.UpdatedAt)
 }
 
@@ -112,11 +112,11 @@ func (r *repositoryRepo) Update(ctx context.Context, repo *domain.Repository) er
 		UPDATE repositories SET
 		  online=$1, format_config=$2, http_config=$3, proxy_config=$4,
 		  cleanup_policy_ids=$5, quota_bytes=$6, routing_rule_id=$7,
-		  allow_anonymous=$8, description=$9, blob_store_id=$10, updated_at=NOW()
-		WHERE name=$11`,
+		  allow_anonymous=$8, hide_from_anonymous_lists=$9, description=$10, blob_store_id=$11, updated_at=NOW()
+		WHERE name=$12`,
 		repo.Online, fmtCfg, httpCfg, proxyCfg,
 		policyIDsToStrings(repo.CleanupPolicyIDs),
-		repo.QuotaBytes, repo.RoutingRuleID, repo.AllowAnonymous, repo.Description, repo.BlobStoreID,
+		repo.QuotaBytes, repo.RoutingRuleID, repo.AllowAnonymous, repo.HideFromAnonymousLists, repo.Description, repo.BlobStoreID,
 		repo.Name,
 	)
 	return err
@@ -151,7 +151,7 @@ func (r *repositoryRepo) ListByBlobStoreID(ctx context.Context, blobStoreID stri
 	rows, err := r.db.Query(ctx, `
 		SELECT id, name, format, type, blob_store_id, online,
 		       format_config, http_config, proxy_config, cleanup_policy_ids,
-		       quota_bytes, routing_rule_id, allow_anonymous, description, created_at, updated_at
+		       quota_bytes, routing_rule_id, allow_anonymous, hide_from_anonymous_lists, description, created_at, updated_at
 		FROM repositories WHERE blob_store_id = $1
 		ORDER BY name`, blobStoreID)
 	if err != nil {
@@ -195,7 +195,7 @@ func scanRepository(row scanner) (*domain.Repository, error) {
 		&repo.BlobStoreID, &repo.Online,
 		&fmtCfgRaw, &httpCfgRaw, &proxyCfgRaw,
 		&cleanupIDs,
-		&repo.QuotaBytes, &repo.RoutingRuleID, &repo.AllowAnonymous, &repo.Description,
+		&repo.QuotaBytes, &repo.RoutingRuleID, &repo.AllowAnonymous, &repo.HideFromAnonymousLists, &repo.Description,
 		&repo.CreatedAt, &updatedAt,
 	)
 	if err != nil {

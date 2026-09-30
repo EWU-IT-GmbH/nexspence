@@ -524,9 +524,10 @@ describe('RepositoriesPage', () => {
     // Step 3 — cleanup checkbox, blob store select, quota, anonymous toggle
     await screen.findByText('Step 3 of 3')
     const checks = screen.getAllByRole('checkbox')
-    // first checkboxes are cleanup policies; last is anonymous access
+    // First checkboxes are cleanup policies.
     fireEvent.click(checks[0]) // toggle a cleanup policy
-    fireEvent.click(checks[checks.length - 1]) // toggle anonymous access
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Allow unauthenticated read access' }))
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Hide from anonymous repository lists' }))
     // change blob store via Select dropdown (default → big)
     await user.click(screen.getByText('default (file)'))
     await user.click(await screen.findByText('big (s3)'))
@@ -535,10 +536,11 @@ describe('RepositoriesPage', () => {
     await user.click(screen.getByRole('button', { name: /^Create$/ }))
 
     await waitFor(() => expect(posted).toBeTruthy())
-    const body = posted! as { name: string; description: string; allowAnonymous: boolean; quotaBytes: number; cleanupPolicyIds?: string[]; blobStoreId?: string }
+    const body = posted! as { name: string; description: string; allowAnonymous: boolean; hideFromAnonymousLists: boolean; quotaBytes: number; cleanupPolicyIds?: string[]; blobStoreId?: string }
     expect(body.name).toBe('full-maven')
     expect(body.description).toBe('a full repo')
     expect(body.allowAnonymous).toBe(true)
+    expect(body.hideFromAnonymousLists).toBe(true)
     expect(body.quotaBytes).toBeGreaterThan(0)
     expect(body.blobStoreId).toBe('bs-2')
     expect(body.cleanupPolicyIds?.length).toBeGreaterThan(0)
@@ -637,6 +639,7 @@ describe('RepositoriesPage', () => {
     const checks = screen.getAllByRole('checkbox')
     fireEvent.click(checks[0]) // online
     fireEvent.click(checks[1]) // anonymous
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Hide from anonymous repository lists' }))
     // description
     await user.type(screen.getByPlaceholderText('Optional'), ' updated')
     // quota
@@ -644,11 +647,12 @@ describe('RepositoriesPage', () => {
     await user.clear(quota)
     await user.type(quota, '2')
     // toggle a cleanup policy checkbox (togglePolicy)
-    const policyCheck = checks[checks.length - 1]
+    const policyCheck = await screen.findByRole('checkbox', { name: /all-cleanup/ })
     fireEvent.click(policyCheck)
     await user.click(screen.getByRole('button', { name: /Save/ }))
     await waitFor(() => expect(put).toBeTruthy())
     expect((put! as { quotaBytes?: number }).quotaBytes).toBeGreaterThan(0)
+    expect(put!.hideFromAnonymousLists).toBe(true)
   })
 
   it('migrates content to a new blob store from the settings modal', async () => {
