@@ -41,7 +41,7 @@ func TestNuGetDiscoverSearchResourceAndRemoteAuthentication(t *testing.T) {
 	resource, err := discoverNuGetResource(context.Background(), repo, searchResourceTypes)
 	require.NoError(t, err)
 	require.Equal(t, search.URL+"/dynamic?tenant=test", resource)
-	b, err := fetchNuGetJSON(context.Background(), repo, resource, 1024)
+	b, err := fetchNuGetJSON(repoproxy.WithTrustedAuthBases(context.Background(), resource), repo, resource, 1024)
 	require.NoError(t, err)
 	require.JSONEq(t, `{"totalHits":0,"data":[]}`, string(b))
 	require.EqualValues(t, 1, auth.Load())
@@ -80,7 +80,7 @@ func TestNuGetDynamicResourceUsesSSRFGuard(t *testing.T) {
 	repoproxy.UpstreamClient = netguard.Client(time.Second)
 	defer func() { repoproxy.UpstreamClient = old }()
 	repo := &domain.Repository{ProxyConfig: map[string]any{"remote_url": "https://example.test"}}
-	_, err := fetchNuGetJSON(context.Background(), repo, upstream.URL, 1024)
+	_, err := fetchNuGetJSON(repoproxy.WithTrustedAuthBases(context.Background(), upstream.URL), repo, upstream.URL, 1024)
 	require.ErrorContains(t, err, "blocked connection")
 }
 func TestNuGetUpstreamParallelismIsBounded(t *testing.T) {

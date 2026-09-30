@@ -92,6 +92,11 @@ func (h *Handler) ServeHTTP(c *gin.Context) {
 					writeQueryError(c, err)
 					return
 				}
+				// groupProxyPath derives the target from this member's service
+				// index. Keep its auth scope local to this member attempt.
+				request := c.Request
+				c.Request = request.WithContext(repoproxy.WithTrustedAuthBases(request.Context(), upstreamPath))
+				defer func() { c.Request = request }()
 			}
 		}
 		// Registration pages embed absolute upstream URLs (packageContent,
