@@ -61,6 +61,10 @@ func (h *Handler) ServeHTTP(c *gin.Context) {
 			h.fetchAndRewriteNuGetIndex(c, repo)
 			return
 		}
+		if p == "/v3/query" || p == "/query" {
+			h.serveProxySearch(c, repo)
+			return
+		}
 		// .nupkg package content is immutable; registration/flat-container index
 		// pages are mutable metadata (new versions appear) and revalidate on a TTL.
 		var maxAge time.Duration
@@ -308,7 +312,7 @@ func (h *Handler) handlePush(c *gin.Context, repoName string) {
 // rewrites all resource @id URLs to point to this proxy, and returns the result.
 // Not cached — fetched live so new resource endpoints appear promptly.
 func (h *Handler) fetchAndRewriteNuGetIndex(c *gin.Context, repo *domain.Repository) {
-	remoteBase, err := repoproxy.RemoteURL(repo)
+	indexURL, err := nugetServiceIndexURL(repo)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -317,12 +321,8 @@ func (h *Handler) fetchAndRewriteNuGetIndex(c *gin.Context, repo *domain.Reposit
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
 	defer cancel()
 
-	// The v3 service index is the ONE fixed path in an otherwise fully
-	// discoverable protocol, and it lives at /v3/index.json on the real
-	// nuget.org (#349). remote_url is the bare origin; a legacy /v3-suffixed
-	// value is normalized so it neither breaks discovery nor doubles itself
-	// onto the resource paths the index advertises.
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, nugetRemoteOrigin(remoteBase)+"/v3/index.json", nil)
+	// Honor explicitly configured service-index paths as well as bare origins.
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, indexURL, nil)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid upstream URL: " + err.Error()})
 		return
@@ -367,6 +367,12 @@ func (h *Handler) fetchAndRewriteNuGetIndex(c *gin.Context, repo *domain.Reposit
 				continue
 			}
 			res["@id"] = localBase + parsed.RequestURI()
+			for _, kind := range searchResourceTypes {
+				if res["@type"] == kind {
+					res["@id"] = localBase + "/v3/query"
+					break
+				}
+			}
 		}
 	}
 
