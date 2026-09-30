@@ -16,7 +16,6 @@ import (
 	"github.com/nexspence-oss/nexspence/internal/nugetmeta"
 )
 
-const remoteResultLimit = 4000
 const remoteCollectionBytes = 32 << 20
 const remoteCacheBytes = 64 << 20
 const remoteCacheTTL = 30 * time.Second
@@ -174,79 +173,67 @@ func (h *Handler) resource(ctx context.Context, repo *domain.Repository, caller 
 	h.remote.put(key, []byte(resource))
 	return resource, nil
 }
-func (h *Handler) remoteSearch(ctx context.Context, repo *domain.Repository, caller string, o SearchOptions) ([]remotePackage, error) {
-	key := remoteKey(caller, repo, "search", o)
+
+// remoteSearchPage is cached independently of the group page. totalHits is an
+// upstream count, never exposed as an authorization-filtered group count.
+type remoteSearchPage struct {
+	TotalHits int             `json:"totalHits"`
+	Data      []remotePackage `json:"data"`
+}
+
+func (h *Handler) remoteSearch(ctx context.Context, repo *domain.Repository, caller string, o SearchOptions) (remoteSearchPage, error) {
+	out := remoteSearchPage{}
+	key := remoteKey(caller, repo, "search-page", o)
 	if b, ok := h.remote.get(key); ok {
-		var out []remotePackage
 		err := json.Unmarshal(b, &out)
 		return out, err
 	}
 	resource, err := h.resource(ctx, repo, caller, searchResourceTypes)
 	if err != nil {
-		return nil, err
+		return out, err
 	}
-	out := []remotePackage{}
+	u, _ := url.Parse(resource)
+	q := u.Query()
+	q.Set("q", o.Query)
+	q.Set("skip", strconv.Itoa(o.Skip))
+	q.Set("take", strconv.Itoa(o.Take))
+	q.Set("prerelease", strconv.FormatBool(o.Prerelease))
+	q.Del("packageType")
+	if o.SemVer2 {
+		q.Set("semVerLevel", "2.0.0")
+	} else {
+		q.Del("semVerLevel")
+	}
+	u.RawQuery = q.Encode()
+	b, err := fetchNuGetJSON(ctx, repo, u.String(), remoteCollectionBytes)
+	if err != nil {
+		return out, err
+	}
+	var doc struct {
+		TotalHits *int             `json:"totalHits"`
+		Data      *[]remotePackage `json:"data"`
+	}
+	if json.Unmarshal(b, &doc) != nil || doc.TotalHits == nil || doc.Data == nil || *doc.TotalHits < 0 {
+		return out, unavailable("invalid_upstream_response")
+	}
+	out.TotalHits, out.Data = *doc.TotalHits, *doc.Data
+	if len(out.Data) > o.Take || (len(out.Data) > 0 && o.Skip+len(out.Data) > out.TotalHits) || (len(out.Data) == 0 && o.Skip < out.TotalHits) {
+		return remoteSearchPage{}, unavailable("incomplete_upstream_results")
+	}
 	seen := map[string]bool{}
-	expected := -1
-	size := 0
-	for page := 0; page < 64; page++ {
-		if len(out) > 3000 {
-			return nil, unavailable("remote_search_too_broad")
+	for i := range out.Data {
+		if err := validateRemotePackage(&out.Data[i], o); err != nil {
+			return remoteSearchPage{}, err
 		}
-		u, _ := url.Parse(resource)
-		q := u.Query()
-		q.Set("q", o.Query)
-		q.Set("skip", strconv.Itoa(len(out)))
-		q.Set("take", "1000")
-		q.Set("prerelease", strconv.FormatBool(o.Prerelease))
-		q.Del("packageType")
-		if o.SemVer2 {
-			q.Set("semVerLevel", "2.0.0")
-		} else {
-			q.Del("semVerLevel")
+		if seen[out.Data[i].ID] {
+			return remoteSearchPage{}, unavailable("upstream_results_changed")
 		}
-		u.RawQuery = q.Encode()
-		b, err := fetchNuGetJSON(ctx, repo, u.String(), remoteCollectionBytes-int64(size))
-		if err != nil {
-			return nil, err
-		}
-		size += len(b)
-		var doc struct {
-			TotalHits *int             `json:"totalHits"`
-			Data      *[]remotePackage `json:"data"`
-		}
-		if json.Unmarshal(b, &doc) != nil || doc.TotalHits == nil || doc.Data == nil || *doc.TotalHits < 0 {
-			return nil, unavailable("invalid_upstream_response")
-		}
-		if *doc.TotalHits > remoteResultLimit {
-			return nil, unavailable("remote_search_too_broad")
-		}
-		if expected < 0 {
-			expected = *doc.TotalHits
-		} else if expected != *doc.TotalHits {
-			return nil, unavailable("upstream_results_changed")
-		}
-		if len(*doc.Data) > 1000 || len(out)+len(*doc.Data) > expected || (len(*doc.Data) == 0 && len(out) < expected) {
-			return nil, unavailable("incomplete_upstream_results")
-		}
-		for _, p := range *doc.Data {
-			if err := validateRemotePackage(&p, o); err != nil {
-				return nil, err
-			}
-			if seen[p.ID] {
-				return nil, unavailable("upstream_results_changed")
-			}
-			seen[p.ID] = true
-			out = append(out, p)
-		}
-		if len(out) == expected {
-			b, err := json.Marshal(out)
-			if err != nil {
-				return nil, err
-			}
-			h.remote.put(key, b)
-			return out, nil
-		}
+		seen[out.Data[i].ID] = true
 	}
-	return nil, unavailable("remote_search_too_broad")
+	b, err = json.Marshal(out)
+	if err != nil {
+		return remoteSearchPage{}, err
+	}
+	h.remote.put(key, b)
+	return out, nil
 }

@@ -18,7 +18,7 @@ import (
 
 func TestRemoteSearchRejectsIncompleteAndOversizedResults(t *testing.T) {
 	for _, tc := range []struct{ name, body, code string }{
-		{"broad", `{"totalHits":4001,"data":[]}`, "remote_search_too_broad"},
+		{"broad-empty-page", `{"totalHits":4001,"data":[]}`, "incomplete_upstream_results"},
 		{"missing-count", `{"data":[]}`, "invalid_upstream_response"},
 		{"missing-data", `{"totalHits":0}`, "invalid_upstream_response"},
 		{"empty-page", `{"totalHits":1,"data":[]}`, "incomplete_upstream_results"},
@@ -47,14 +47,14 @@ func TestRemoteSearchRejectsIncompleteAndOversizedResults(t *testing.T) {
 		})
 	}
 }
-func TestRemoteSearchDetectsChangingPagesAndEncodesParameters(t *testing.T) {
+func TestRemoteSearchFetchesOnlyRequestedPageAndEncodesParameters(t *testing.T) {
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/v3/index.json" {
 			fmt.Fprintf(w, `{"resources":[{"@type":"SearchQueryService","@id":%q}]}`, server.URL+"/search?tenant=one")
 			return
 		}
-		if r.URL.Query().Get("q") != "a+b %_\\" || r.URL.Query().Get("tenant") != "one" || r.URL.Query().Get("prerelease") != "true" || r.URL.Query().Get("semVerLevel") != "2.0.0" || r.URL.Query().Get("take") != "1000" {
+		if r.URL.Query().Get("q") != "a+b %_\\" || r.URL.Query().Get("tenant") != "one" || r.URL.Query().Get("prerelease") != "true" || r.URL.Query().Get("semVerLevel") != "2.0.0" || r.URL.Query().Get("take") != "1" {
 			t.Error("search parameters were changed")
 		}
 		skip, _ := strconv.Atoi(r.URL.Query().Get("skip"))
@@ -67,8 +67,10 @@ func TestRemoteSearchDetectsChangingPagesAndEncodesParameters(t *testing.T) {
 	defer server.Close()
 	h := New(formats.Deps{})
 	repo := &domain.Repository{ProxyConfig: map[string]any{"remote_url": server.URL}}
-	_, err := h.remoteSearch(context.Background(), repo, "caller", SearchOptions{Query: "a+b %_\\", Take: 1, Prerelease: true, SemVer2: true})
-	require.ErrorContains(t, err, "upstream_results_changed")
+	page, err := h.remoteSearch(context.Background(), repo, "caller", SearchOptions{Query: "a+b %_\\", Take: 1, Prerelease: true, SemVer2: true})
+	require.NoError(t, err)
+	require.Equal(t, 2, page.TotalHits)
+	require.Len(t, page.Data, 1)
 }
 func TestRemoteCacheTTLBoundsAndContextKeys(t *testing.T) {
 	cache := newRemoteCache()
@@ -98,4 +100,43 @@ func TestRemoteCacheTTLBoundsAndContextKeys(t *testing.T) {
 	require.NotEqual(t, key, remoteKey("user-one", repo, "search", SearchOptions{Take: 20, Skip: 1}))
 	repo.ProxyConfig["remote_password"] = "changed"
 	require.NotEqual(t, key, remoteKey("user-one", repo, "search", SearchOptions{Take: 20}))
+}
+
+func TestRemoteSearchCancellationStopsUpstream(t *testing.T) {
+	started := make(chan struct{})
+	stopped := make(chan struct{})
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v3/index.json" {
+			fmt.Fprintf(w, `{"resources":[{"@type":"SearchQueryService","@id":%q}]}`, server.URL+"/search")
+			return
+		}
+		close(started)
+		<-r.Context().Done()
+		close(stopped)
+	}))
+	defer server.Close()
+	h := New(formats.Deps{})
+	repo := &domain.Repository{ProxyConfig: map[string]any{"remote_url": server.URL}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() { _, err := h.remoteSearch(ctx, repo, "caller", SearchOptions{Take: 100}); result <- err }()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("upstream was not called")
+	}
+	cancel()
+	select {
+	case err := <-result:
+		require.Error(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("search did not stop")
+	}
+	select {
+	case <-stopped:
+	case <-time.After(2 * time.Second):
+		t.Fatal("upstream did not observe cancellation")
+	}
 }

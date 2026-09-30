@@ -18,20 +18,23 @@ import (
 type searchChoice struct {
 	candidate repository.NuGetCandidate
 	remote    *remotePackage
+	metadata  *nugetmeta.Metadata
 	source    *domain.Repository
 	priority  int
 	downloads int64
 	matched   bool
 }
 
-func (h *Handler) searchRemotes(ctx context.Context, proxies []*domain.Repository, scope SearchScope, o SearchOptions) ([][]remotePackage, error) {
+func (h *Handler) searchRemotes(ctx context.Context, proxies []*domain.Repository, scope SearchScope, o SearchOptions, offsets []int, done []bool) ([]remoteSearchPage, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	results := make([][]remotePackage, len(proxies))
+	results := make([]remoteSearchPage, len(proxies))
 	failures := make([]error, len(proxies))
 	jobs := make(chan int, len(proxies))
 	for i := range proxies {
-		jobs <- i
+		if !done[i] {
+			jobs <- i
+		}
 	}
 	close(jobs)
 	var wg sync.WaitGroup
@@ -45,7 +48,9 @@ func (h *Handler) searchRemotes(ctx context.Context, proxies []*domain.Repositor
 					failures[i] = ctx.Err()
 					continue
 				}
-				results[i], failures[i] = h.remoteSearch(ctx, proxies[i], scope.Caller, o)
+				pageOptions := o
+				pageOptions.Skip = offsets[i]
+				results[i], failures[i] = h.remoteSearch(ctx, proxies[i], scope.Caller, pageOptions)
 				if failures[i] == nil {
 					b, err := json.Marshal(results[i])
 					failures[i] = err
@@ -86,12 +91,129 @@ func (h *Handler) federatedSearch(ctx context.Context, scope SearchScope, o Sear
 	if err != nil {
 		return out, err
 	}
-	remotes, err := h.searchRemotes(ctx, proxies, scope, o)
-	if err != nil {
-		return out, err
+	// Fetch an exact ID independently of its position in a broad upstream search.
+	exact := make([][]remotePackage, len(proxies))
+	query := strings.ToLower(strings.TrimSpace(o.Query))
+	if query != "" && nugetmeta.ValidID(query) {
+		exactOptions := o
+		exactOptions.Query, exactOptions.Skip, exactOptions.Take = "packageid:"+query, 0, 1
+		pages, err := h.searchRemotes(ctx, proxies, scope, exactOptions, make([]int, len(proxies)), make([]bool, len(proxies)))
+		if err != nil {
+			return out, err
+		}
+		for i, page := range pages {
+			for _, p := range page.Data {
+				if strings.EqualFold(p.ID, query) {
+					exact[i] = append(exact[i], p)
+				}
+			}
+		}
+	}
+	remotes := make([][]remotePackage, len(proxies))
+	offsets := make([]int, len(proxies))
+	totals := make([]int, len(proxies))
+	done := make([]bool, len(proxies))
+	seen := make([]map[string]bool, len(proxies))
+	for i := range proxies {
+		totals[i] = -1
+		seen[i] = map[string]bool{}
+	}
+	pageOptions := o
+	pageOptions.Take = min(1000, max(100, o.Skip+o.Take+1))
+	bytes := 0
+	for {
+		if err := ctx.Err(); err != nil {
+			return out, err
+		}
+		pages, err := h.searchRemotes(ctx, proxies, scope, pageOptions, offsets, done)
+		if err != nil {
+			return out, err
+		}
+		complete := true
+		frontier := int(^uint(0) >> 1)
+		for i, page := range pages {
+			if !done[i] {
+				if totals[i] >= 0 && totals[i] != page.TotalHits {
+					return out, unavailable("upstream_results_changed")
+				}
+				totals[i] = page.TotalHits
+				for _, p := range page.Data {
+					if seen[i][p.ID] {
+						return out, unavailable("upstream_results_changed")
+					}
+					seen[i][p.ID] = true
+				}
+				b, _ := json.Marshal(page.Data)
+				bytes += len(b)
+				if bytes > remoteCollectionBytes {
+					return out, unavailable("result_too_large")
+				}
+				remotes[i] = append(remotes[i], page.Data...)
+				offsets[i] += len(page.Data)
+				done[i] = offsets[i] >= page.TotalHits
+			}
+			if !done[i] {
+				complete = false
+				frontier = min(frontier, offsets[i])
+			}
+		}
+		out, err = h.mergeSearchWindow(ctx, scope, o, proxies, remotes, exact, frontier)
+		if err != nil {
+			return out, err
+		}
+		if complete {
+			return out, nil
+		}
+		// One visible look-ahead result is proof of another page. Do not leak
+		// upstream totals, which include duplicates and potentially hidden IDs.
+		if out.TotalHits > o.Skip+o.Take {
+			out.TotalHits = o.Skip + len(out.Data) + 1
+			return out, nil
+		}
+	}
+}
+
+// Hosted exact, proxy exact, hosted prefix, other hosted, then proxy relevance.
+// The unfinished-source frontier applies only to ordinary proxy hits. Hosted
+// hits and the independently fetched exact hits are known before paging.
+func (h *Handler) mergeSearchWindow(ctx context.Context, scope SearchScope, o SearchOptions, proxies []*domain.Repository, remotes, exact [][]remotePackage, frontier int) (SearchResponse, error) {
+	out := SearchResponse{Data: []SearchResult{}}
+	type rank struct{ tier, position, source int }
+	ranks := map[string]rank{}
+	remember := func(id string, position, source int) {
+		prior, ok := ranks[id]
+		if !ok || position < prior.position || (position == prior.position && source < prior.source) {
+			ranks[id] = rank{4, position, source}
+		}
+	}
+	for source, docs := range remotes {
+		for position, p := range docs {
+			remember(p.ID, position, source+1)
+		}
+	}
+	combined := make([][]remotePackage, len(remotes))
+	for source := range remotes {
+		combined[source] = append(combined[source], exact[source]...)
+		for _, p := range exact[source] {
+			ranks[p.ID] = rank{1, 0, source + 1}
+		}
+		// Exact packages are inserted once; their regular-page position still counts
+		// towards upstream offsets, so removing the duplicate cannot skip a raw hit.
+		for _, p := range remotes[source] {
+			isExact := false
+			for _, e := range exact[source] {
+				if p.ID == e.ID {
+					isExact = true
+					break
+				}
+			}
+			if !isExact {
+				combined[source] = append(combined[source], p)
+			}
+		}
 	}
 	packages := map[string]map[string]*searchChoice{}
-	for priority, docs := range remotes {
+	for priority, docs := range combined {
 		for _, doc := range docs {
 			p := doc
 			if packages[p.ID] == nil {
@@ -110,7 +232,7 @@ func (h *Handler) federatedSearch(ctx context.Context, scope SearchScope, o Sear
 			}
 		}
 	}
-	err = h.deps.NuGet.Snapshot(ctx, func(snapshot repository.NuGetSnapshot) error {
+	err := h.deps.NuGet.Snapshot(ctx, func(snapshot repository.NuGetSnapshot) error {
 		ready, err := snapshot.Ready(ctx, scope.Members)
 		if err != nil {
 			return err
@@ -119,9 +241,18 @@ func (h *Handler) federatedSearch(ctx context.Context, scope SearchScope, o Sear
 			return unavailable("metadata_not_ready")
 		}
 		size := 0
+		localIDs := []string{}
 		// A local version shadows a remote copy even if its local ID did not match
 		// the upstream's description/tag query. Local candidates stay in one snapshot.
 		err = packageCandidates(ctx, snapshot, scope, repository.NuGetQuery{Repositories: scope.Members}, o.SemVer2, func(id string, candidates []repository.NuGetCandidate) error {
+			if strings.Contains(id, strings.ToLower(o.Query)) {
+				for _, c := range candidates {
+					if c.Listed && (o.Prerelease || !c.Prerelease) && (o.SemVer2 || !c.SemVer2) {
+						localIDs = append(localIDs, id)
+						break
+					}
+				}
+			}
 			_, remoteMatch := packages[id]
 			if !remoteMatch && !strings.Contains(id, strings.ToLower(o.Query)) {
 				return nil
@@ -141,9 +272,23 @@ func (h *Handler) federatedSearch(ctx context.Context, scope SearchScope, o Sear
 		if err != nil {
 			return err
 		}
+		score := func(id string) int { return hostedSearchTier(id, o.Query) }
+		sort.Slice(localIDs, func(i, j int) bool {
+			a, b := score(localIDs[i]), score(localIDs[j])
+			if a != b {
+				return a < b
+			}
+			return localIDs[i] < localIDs[j]
+		})
+		for i, id := range localIDs {
+			ranks[id] = rank{score(id), i, 0}
+		}
 		// A version missing from an earlier source's search may exist there unlisted
 		// or may not match that source's query semantics. Do not substitute a later copy.
 		for id, versions := range packages {
+			if ranks[id].tier == 4 && ranks[id].position >= frontier {
+				continue
+			}
 			for priority, proxy := range proxies {
 				needed := false
 				for _, choice := range versions {
@@ -162,7 +307,9 @@ func (h *Handler) federatedSearch(ctx context.Context, scope SearchScope, o Sear
 				for _, record := range records {
 					key := record.Metadata.Key
 					if choice, ok := versions[key]; ok && choice.priority > priority {
-						versions[key] = &searchChoice{candidate: repository.NuGetCandidate{ID: id, Key: key}, priority: priority, matched: false}
+						m := record.Metadata
+						candidate := repository.NuGetCandidate{Repository: proxy.Name, ID: id, Key: key, Version: m.Version, Listed: m.Listed, Prerelease: m.Prerelease, SemVer2: m.SemVer2}
+						versions[key] = &searchChoice{candidate: candidate, metadata: &m, source: proxy, priority: priority, matched: visible(scope, candidate, o.SemVer2)}
 					}
 				}
 			}
@@ -175,11 +322,23 @@ func (h *Handler) federatedSearch(ctx context.Context, scope SearchScope, o Sear
 					delete(versions, key)
 				}
 			}
-			if len(versions) > 0 {
+			if len(versions) > 0 && (ranks[id].tier < 4 || ranks[id].position < frontier) {
 				ids = append(ids, id)
 			}
 		}
-		sort.Strings(ids)
+		sort.Slice(ids, func(i, j int) bool {
+			a, b := ranks[ids[i]], ranks[ids[j]]
+			if a.tier != b.tier {
+				return a.tier < b.tier
+			}
+			if a.position != b.position {
+				return a.position < b.position
+			}
+			if a.source != b.source {
+				return a.source < b.source
+			}
+			return ids[i] < ids[j]
+		})
 		out.TotalHits = len(ids)
 		if o.Skip >= len(ids) {
 			return nil
@@ -224,6 +383,8 @@ func (h *Handler) federatedSearch(ctx context.Context, scope SearchScope, o Sear
 					return unavailable("search_unavailable")
 				}
 				metadata = record.Metadata
+			} else if latest.metadata != nil {
+				metadata = *latest.metadata
 			} else {
 				version, _ := nugetmeta.ParseVersion(latest.candidate.Version)
 				metadata = latest.remote.metadata(version)

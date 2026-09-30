@@ -368,3 +368,19 @@ func TestHostedSearchHundredsOfDistinctPackages(t *testing.T) {
 	require.Equal(t, "package500", r.Data[0].ID)
 	require.Equal(t, "package502", r.Data[2].ID)
 }
+
+func TestHostedRankingBeforePagination(t *testing.T) {
+	f := hosted(t)
+	for _, id := range []string{"a-foo", "Foo.Extensions", "FOO", "Foo.Core"} {
+		f.push(t, id, "1.0.0")
+	}
+	r := f.search(t, "?q=fOo&take=2")
+	require.Equal(t, 4, r.TotalHits)
+	require.Equal(t, "foo", r.Data[0].ID)
+	require.Equal(t, "foo.core", r.Data[1].ID)
+	r = f.search(t, "?q=fOo&skip=2&take=2")
+	require.Equal(t, "foo.extensions", r.Data[0].ID)
+	require.Equal(t, "a-foo", r.Data[1].ID)
+	r = f.search(t, "?take=1")
+	require.Equal(t, "a-foo", r.Data[0].ID)
+}

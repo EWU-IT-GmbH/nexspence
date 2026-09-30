@@ -32,7 +32,7 @@ func (h *Handler) serveProxySearch(c *gin.Context, repo *domain.Repository) {
 		query[key] = values
 	}
 	u.RawQuery = query.Encode()
-	body, err := fetchNuGetJSON(c.Request.Context(), repo, u.String(), maxSearchBytes)
+	body, err := fetchNuGetJSON(c.Request.Context(), repo, u.String(), remoteCollectionBytes)
 	if err != nil {
 		writeQueryError(c, err)
 		return
@@ -41,5 +41,5 @@ func (h *Handler) serveProxySearch(c *gin.Context, repo *domain.Repository) {
 		writeQueryError(c, unavailable("invalid_upstream_response"))
 		return
 	}
-	writeNuGetJSON(c, json.RawMessage(body), false)
+	writeNuGetJSONLimit(c, json.RawMessage(body), false, remoteCollectionBytes)
 }

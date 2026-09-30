@@ -159,3 +159,41 @@ NuGet test coverage is in `internal/formats/nuget`, `internal/nugetmeta` and
 `scripts/nuget-remote-restore-smoke.py`. These integration helpers require a test
 instance; inspect their usage before running them. Full upstream test-suite
 success is not claimed by the release-tooling checks.
+
+### Federated NuGet search paging
+
+Group search fetches bounded upstream pages until it has the requested visible
+page and one look-ahead hit, instead of collecting the entire remote result set.
+A large upstream `totalHits` alone is not an error. Pages are cached briefly per
+caller, repository configuration, query and offset; authorization is reapplied
+on every request and cancellation propagates to upstream requests.
+
+Ranking is applied before pagination: hosted exact ID, proxy exact ID, hosted
+prefix matches, other matching hosted IDs, then remaining proxy hits in upstream
+relevance order. Exact matching is case-insensitive. A matching hosted ID owns
+its position even if the proxy also returns that ID. Empty searches list hosted
+IDs first, followed by proxies, without exact/prefix promotion. Hosted ties use
+alphabetical ID order; multiple proxies interleave their upstream relevance ranks
+with repository order breaking ties.
+
+For a nonempty valid package ID, a separate `packageid:` search discovers the
+exact remote match even when it lies beyond the fetched regular upstream page.
+That ID is removed from the regular stream without changing raw upstream offsets.
+For unchanged source results this produces the same sequence for different
+client page sizes. As with upstream offset paging, concurrent catalog changes
+can shift pages; inconsistent totals or repeated IDs within a collection fail
+explicitly. Version ownership and unlisted precedence are still enforced.
+Registration is fetched during search only when source precedence or filtering
+requires metadata that the search response does not provide.
+
+Until all sources are exhausted, the group reports a conservative `totalHits`
+(`skip + returned count + 1`) supported by a visible look-ahead hit, not a summed
+or exact global total. The exact deduplicated, authorized count is returned when
+all sources are exhausted. Search responses are bounded to 32 MiB; existing
+request timeouts and collection limits still apply, especially to deep pages
+or queries whose results are mostly hidden by content selectors.
+
+The opt-in `scripts/nuget-remote-restore-smoke.py` checks empty and single-letter
+Rider searches with `take=300`, then searches for and restores NuGet.Versioning
+with an empty client cache. Use `--direct` to test the direct proxy instead of
+the group.

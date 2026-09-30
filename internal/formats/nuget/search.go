@@ -323,6 +323,21 @@ type SearchResponse struct {
 	Data      []SearchResult `json:"data"`
 }
 
+// Shared hosted ordering for standalone repositories and federated groups.
+func hostedSearchTier(id, query string) int {
+	query = strings.ToLower(strings.TrimSpace(query))
+	if query == "" {
+		return 3
+	}
+	if strings.EqualFold(id, query) {
+		return 0
+	}
+	if strings.HasPrefix(strings.ToLower(id), query) {
+		return 2
+	}
+	return 3
+}
+
 func (h *Handler) Search(ctx context.Context, scope SearchScope, o SearchOptions) (SearchResponse, error) {
 	out := SearchResponse{Data: []SearchResult{}}
 	if h.deps.NuGet == nil || scope.Repository == nil || scope.CanRead == nil {
@@ -354,17 +369,47 @@ func (h *Handler) Search(ctx context.Context, scope SearchScope, o SearchOptions
 			if len(matches) == 0 {
 				return nil
 			}
-			position := out.TotalHits
-			out.TotalHits++
-			if position >= o.Skip && len(ids) < o.Take {
-				ids = append(ids, id)
-				for _, c := range matches {
-					selectedBytes += len(c.Version) + len(c.ID) + 256
-					if selectedBytes > maxSearchBytes {
-						return unavailable("result_too_large")
-					}
-					selected = append(selected, c.AssetID)
+			ids = append(ids, id)
+			selectedBytes += len(id)
+			if selectedBytes > remoteCollectionBytes {
+				return unavailable("result_too_large")
+			}
+			return nil
+		})
+		if e != nil {
+			return e
+		}
+		sort.Slice(ids, func(i, j int) bool {
+			a, b := hostedSearchTier(ids[i], o.Query), hostedSearchTier(ids[j], o.Query)
+			if a != b {
+				return a < b
+			}
+			return ids[i] < ids[j]
+		})
+		out.TotalHits = len(ids)
+		if o.Skip >= len(ids) {
+			return nil
+		}
+		ids = ids[o.Skip:min(len(ids), o.Skip+o.Take)]
+		selectedIDs := map[string]bool{}
+		for _, id := range ids {
+			selectedIDs[id] = true
+		}
+		selectedBytes = 0
+		// Reuse the same snapshot, loading version references only for the chosen IDs.
+		e = packageCandidates(ctx, s, scope, repository.NuGetQuery{Repositories: scope.Members, Query: o.Query}, o.SemVer2, func(id string, cs []repository.NuGetCandidate) error {
+			if !selectedIDs[id] {
+				return nil
+			}
+			for _, c := range cs {
+				if !c.Listed || (!o.Prerelease && c.Prerelease) || (!o.SemVer2 && c.SemVer2) {
+					continue
 				}
+				selectedBytes += len(c.Version) + len(c.ID) + 256
+				if selectedBytes > maxSearchBytes {
+					return unavailable("result_too_large")
+				}
+				selected = append(selected, c.AssetID)
 			}
 			return nil
 		})
@@ -438,7 +483,14 @@ func (h *Handler) serveSearch(c *gin.Context, repo *domain.Repository) {
 		writeQueryError(c, e)
 		return
 	}
-	writeNuGetJSON(c, result, false)
+	if len(scope.Proxies) > 0 {
+		// A normal Rider page of popular packages can contain tens of thousands
+		// of version entries. Keep it bounded without applying the small-document
+		// limit used for individual registration and hosted metadata documents.
+		writeNuGetJSONLimit(c, result, false, remoteCollectionBytes)
+	} else {
+		writeNuGetJSON(c, result, false)
+	}
 }
 func writeQueryError(c *gin.Context, e error) {
 	status, code := 503, "search_unavailable"
@@ -465,6 +517,10 @@ func writeQueryError(c *gin.Context, e error) {
 	}
 }
 func writeNuGetJSON(c *gin.Context, v any, gzipBody bool) {
+	writeNuGetJSONLimit(c, v, gzipBody, maxSearchBytes)
+}
+
+func writeNuGetJSONLimit(c *gin.Context, v any, gzipBody bool, limit int) {
 	if e := c.Request.Context().Err(); e != nil {
 		writeQueryError(c, e)
 		return
@@ -478,7 +534,7 @@ func writeNuGetJSON(c *gin.Context, v any, gzipBody bool) {
 		writeQueryError(c, e)
 		return
 	}
-	if len(b) > maxSearchBytes {
+	if len(b) > limit {
 		writeQueryError(c, unavailable("result_too_large"))
 		return
 	}

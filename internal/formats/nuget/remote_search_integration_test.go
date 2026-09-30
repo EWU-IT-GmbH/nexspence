@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -18,6 +19,7 @@ import (
 	"testing"
 
 	"github.com/nexspence-oss/nexspence/internal/domain"
+	"github.com/nexspence-oss/nexspence/internal/formats/nuget"
 	"github.com/nexspence-oss/nexspence/internal/nugetmeta"
 	"github.com/stretchr/testify/require"
 )
@@ -271,8 +273,8 @@ func TestFederatedSearchFourThousandGlobalResults(t *testing.T) {
 	r := f.groupSearch(t, "all", "?skip=3999&take=2", "admin")
 	require.Equal(t, 4001, r.TotalHits)
 	require.Len(t, r.Data, 2)
-	require.Equal(t, "pkg3998", r.Data[0].ID)
-	require.Equal(t, "pkg3999", r.Data[1].ID)
+	require.Equal(t, "pkg0002", r.Data[0].ID)
+	require.Equal(t, "pkg0001", r.Data[1].ID)
 	require.Equal(t, 4, feed.calls("/find"))
 	require.Equal(t, r, f.groupSearch(t, "all", "?skip=3999&take=2", "admin"))
 	require.Equal(t, 4, feed.calls("/find"))
@@ -328,11 +330,11 @@ func TestFederatedSearchCacheRechecksPermissionsAndDoesNotForwardCredentials(t *
 	}
 	previous := feed.calls("/find")
 	f.groupSearch(t, "all", "?q=public", "reader")
-	require.Equal(t, previous+1, feed.calls("/find"), "caller context must not reuse admin cache entries")
+	require.Equal(t, previous+2, feed.calls("/find"), "exact and regular searches must not reuse another caller cache")
 	proxy.ProxyConfig["remote_username"] = "new-user"
 	require.NoError(t, f.deps.Repos.Update(context.Background(), proxy))
 	f.groupSearch(t, "all", "?q=public", "reader")
-	require.Equal(t, previous+2, feed.calls("/find"))
+	require.Equal(t, previous+4, feed.calls("/find"))
 }
 
 func TestFederatedSearchFailsRatherThanReturningLocalPartialData(t *testing.T) {
@@ -353,7 +355,7 @@ func TestFederatedSearchFailsRatherThanReturningLocalPartialData(t *testing.T) {
 	f.addRepo(t, "all", domain.TypeGroup, "hosted", "proxy")
 	w := f.requestRepo(t, "GET", "all", "/v3/query", "admin")
 	require.Equal(t, 503, w.Code)
-	require.JSONEq(t, `{"error":"remote_search_too_broad"}`, w.Body.String())
+	require.JSONEq(t, `{"error":"incomplete_upstream_results"}`, w.Body.String())
 	remote.Close()
 	w = f.requestRepo(t, "GET", "all", "/v3/query", "admin")
 	require.Equal(t, 503, w.Code)
@@ -377,4 +379,127 @@ func TestFederatedRemoteFiltersAndUnavailableWinner(t *testing.T) {
 	require.Equal(t, 503, w.Code)
 	require.Contains(t, w.Body.String(), "upstream_package_unavailable")
 	require.Zero(t, second.calls("/content/filters/1.10.0/filters.1.10.0.nupkg"))
+}
+
+func TestFederatedBroadSearchPagesPreserveRelevanceAndDeduplicate(t *testing.T) {
+	f := hosted(t)
+	packages := map[string][]remoteTestVersion{}
+	for i := 0; i < 4501; i++ {
+		packages[fmt.Sprintf("pkg%04d", i)] = []remoteTestVersion{{"1.0.0", "", true, 1, nil}}
+	}
+	feed := newRemoteFeed(t, packages)
+	f.addRemote(t, "proxy", feed)
+	f.addRepo(t, "all", domain.TypeGroup, "hosted", "proxy")
+	f.push(t, "pkg4500", "1.0.0") // local copy of the first upstream relevance hit
+	f.push(t, "local-only", "1.0.0")
+	first := f.groupSearch(t, "all", "?take=20", "admin")
+	require.Len(t, first.Data, 20)
+	require.Equal(t, 21, first.TotalHits, "lower bound with one proven additional visible hit")
+	require.Equal(t, "local-only", first.Data[0].ID)
+	require.Equal(t, "pkg4500", first.Data[1].ID)
+	require.Equal(t, "pkg4499", first.Data[2].ID, "retain upstream relevance, not alphabetical order")
+	require.Equal(t, 1, feed.calls("/find"), "do not collect the full remote catalog")
+	require.Zero(t, feed.calls("/metadata/pkg4500/index.json"), "search metadata is sufficient for this page")
+	next := f.groupSearch(t, "all", "?skip=20&take=20", "admin")
+	all := f.groupSearch(t, "all", "?take=40", "admin")
+	ids := func(r nuget.SearchResponse) []string {
+		result := []string{}
+		for _, p := range r.Data {
+			result = append(result, p.ID)
+		}
+		return result
+	}
+	combined := append(ids(first), ids(next)...)
+	require.Equal(t, ids(all), combined)
+	require.Len(t, uniqueStrings(combined), 40)
+	rider := f.groupSearch(t, "all", "?q=pkg&take=300&prerelease=true&semVerLevel=2.0.0", "admin")
+	require.Len(t, rider.Data, 300)
+	require.Equal(t, "pkg4500", rider.Data[0].ID)
+	require.Equal(t, 301, rider.TotalHits)
+}
+
+func uniqueStrings(values []string) map[string]bool {
+	out := map[string]bool{}
+	for _, v := range values {
+		out[v] = true
+	}
+	return out
+}
+
+func TestFederatedPagedSearchUsesEarlierSourceOutsideFetchedWindow(t *testing.T) {
+	f := hosted(t)
+	firstPackages := map[string][]remoteTestVersion{}
+	for i := 0; i < 150; i++ {
+		firstPackages[fmt.Sprintf("z%03d", i)] = []remoteTestVersion{{"1.0.0", "", true, 1, nil}}
+	}
+	firstPackages["a-shared"] = []remoteTestVersion{{"1.0.0", "priority winner", true, 1, nil}}
+	first := newRemoteFeed(t, firstPackages)
+	second := newRemoteFeed(t, map[string][]remoteTestVersion{"A-SHARED": {{"1.0.0", "wrong later copy", true, 1, nil}}})
+	f.addRemote(t, "first", first)
+	f.addRemote(t, "second", second)
+	f.addRepo(t, "all", domain.TypeGroup, "hosted", "first", "second")
+	page := f.groupSearch(t, "all", "?take=2", "admin")
+	require.Len(t, page.Data, 2)
+	require.Equal(t, "z149", page.Data[0].ID)
+	require.Equal(t, "a-shared", page.Data[1].ID)
+	require.Equal(t, "priority winner", page.Data[1].Description)
+	require.Equal(t, 1, first.calls("/find"))
+	require.Equal(t, 1, first.calls("/metadata/a-shared/index.json"))
+	next := f.groupSearch(t, "all", "?skip=2&take=2", "admin")
+	require.Equal(t, "z148", next.Data[0].ID)
+	require.Equal(t, "z147", next.Data[1].ID)
+}
+
+func TestFederatedFixedPriorityBeforePagination(t *testing.T) {
+	f := hosted(t)
+	f.push(t, "Foo.Extensions", "1.0.0")
+	f.push(t, "Foo.Core", "1.0.0")
+	f.push(t, "a-foo", "1.0.0")
+	packages := map[string][]remoteTestVersion{
+		"FOO":            {{"2.0.0", "exact remote", true, 1, nil}},
+		"FOO.CORE":       {{"2.0.0", "remote version of hosted ID", true, 1, nil}},
+		"FOO.EXTENSIONS": {{"1.0.0", "duplicate hosted", true, 1, nil}},
+	}
+	for i := 0; i < 160; i++ {
+		packages[fmt.Sprintf("z-foo%03d", i)] = []remoteTestVersion{{"1.0.0", "", true, 1, nil}}
+	}
+	feed := newRemoteFeed(t, packages)
+	f.addRemote(t, "proxy", feed)
+	f.addRepo(t, "all", domain.TypeGroup, "hosted", "proxy")
+	ids := func(query string) []string {
+		r := f.groupSearch(t, "all", query, "admin")
+		out := []string{}
+		for _, p := range r.Data {
+			out = append(out, p.ID)
+		}
+		return out
+	}
+	expected := []string{"foo", "foo.core", "foo.extensions", "a-foo", "z-foo159", "z-foo158"}
+	// Exact is outside the first regular upstream page, but must still lead it.
+	require.Equal(t, expected, ids("?q=fOo&take=6"))
+	split := []string{}
+	for skip := 0; skip < 6; skip += 2 {
+		split = append(split, ids(fmt.Sprintf("?q=fOo&skip=%d&take=2", skip))...)
+	}
+	require.Equal(t, expected, split)
+	require.Equal(t, []string{"a-foo", "foo.core", "foo.extensions", "z-foo159", "z-foo158", "z-foo157"}, ids("?take=6"))
+	// A hosted exact ID takes ownership of its rank, including a proxy duplicate.
+	f.push(t, "FoO", "1.0.0")
+	require.Equal(t, expected, ids("?q=FOO&take=6"))
+	// Crossing the raw position of the promoted exact ID must not emit it again.
+	all := ids("?q=foo&take=300")
+	require.Len(t, all, 164)
+	require.Len(t, uniqueStrings(all), 164)
+	tail := ids("?q=foo&skip=150&take=20")
+	require.Equal(t, all[150:], tail)
+	feed.mu.Lock()
+	defer feed.mu.Unlock()
+	exactRequest := false
+	for _, r := range feed.requests {
+		if r.path == "/find" && url.Values(r.query).Get("q") == "packageid:foo" {
+			exactRequest = true
+			require.Equal(t, "1", url.Values(r.query).Get("take"))
+		}
+	}
+	require.True(t, exactRequest)
 }

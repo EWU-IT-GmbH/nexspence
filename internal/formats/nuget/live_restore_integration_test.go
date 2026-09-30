@@ -65,6 +65,21 @@ func TestFederatedLiveRestoreGate(t *testing.T) {
 	})
 	server.Config.Handler = router
 	server.Start()
+	// Rider also searches while the box is empty and after the first keystroke.
+	for _, query := range []string{"", "N"} {
+		response, err := http.Get(server.URL + "/repository/" + feed + "/v3/query?q=" + query + "&skip=0&take=300&prerelease=true&semVerLevel=2.0.0")
+		require.NoError(t, err)
+		var page struct {
+			Data  []json.RawMessage `json:"data"`
+			Error string            `json:"error"`
+		}
+		err = json.NewDecoder(response.Body).Decode(&page)
+		response.Body.Close()
+		require.NoError(t, err)
+		require.Equal(t, 200, response.StatusCode, page.Error)
+		require.Len(t, page.Data, 300)
+		t.Logf("Live Rider broad search q=%q: 300 results", query)
+	}
 	response, err := http.Get(server.URL + "/repository/" + feed + "/v3/query?q=Nuget.Versioning&skip=0&take=300&prerelease=true&semVerLevel=2.0.0")
 	require.NoError(t, err)
 	defer response.Body.Close()
@@ -76,6 +91,8 @@ func TestFederatedLiveRestoreGate(t *testing.T) {
 	}
 	require.NoError(t, json.NewDecoder(response.Body).Decode(&result))
 	require.Equal(t, 200, response.StatusCode)
+	require.NotEmpty(t, result.Data)
+	require.True(t, strings.EqualFold(result.Data[0].ID, "NuGet.Versioning"), "exact package ID must precede all other results")
 	version := ""
 	for _, p := range result.Data {
 		if strings.EqualFold(p.ID, "NuGet.Versioning") {
