@@ -7,10 +7,13 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/nexspence-oss/nexspence/internal/domain"
 	"github.com/nexspence-oss/nexspence/internal/formats/repoproxy"
 )
+
+const upstreamMetadataTimeout = 30 * time.Second
 
 // Bound outbound NuGet metadata work across handlers and concurrent clients.
 var nugetUpstreamSlots = make(chan struct{}, 4)
@@ -51,7 +54,9 @@ func fetchNuGetDocument(ctx context.Context, repo *domain.Repository, target str
 	if _, err := validateResourceURL(target); err != nil {
 		return nil, err
 	}
-	ctx, cancel := context.WithTimeout(ctx, searchTimeout)
+	// Bound queueing even for callers without a deadline; search and restore
+	// keep their own shorter overall deadlines through the parent context.
+	ctx, cancel := context.WithTimeout(ctx, restoreTimeout)
 	defer cancel()
 	select {
 	case nugetUpstreamSlots <- struct{}{}:
@@ -59,6 +64,9 @@ func fetchNuGetDocument(ctx context.Context, repo *domain.Repository, target str
 		return nil, ctx.Err()
 	}
 	defer func() { <-nugetUpstreamSlots }()
+	// Start the network budget only after admission, not while waiting for a slot.
+	ctx, cancelFetch := context.WithTimeout(ctx, upstreamMetadataTimeout)
+	defer cancelFetch()
 	resp, err := repoproxy.FetchUpstreamOnce(ctx, repo, target, "", http.Header{"Accept": []string{"application/json"}})
 	if err != nil {
 		return nil, err

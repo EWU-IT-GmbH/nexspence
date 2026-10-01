@@ -18,6 +18,10 @@ import (
 	"github.com/nexspence-oss/nexspence/internal/repository"
 )
 
+// Restore may queue behind other packages and fetch multiple registration pages.
+// Keep its overall budget separate from the interactive search deadline.
+const restoreTimeout = 2 * time.Minute
+
 func gzipJSON(b []byte) ([]byte, error) {
 	var out bytes.Buffer
 	w := gzip.NewWriter(&out)
@@ -71,7 +75,7 @@ func (h *Handler) localVersions(ctx context.Context, scope SearchScope, id strin
 }
 func (h *Handler) readScope(c *gin.Context, repo *domain.Repository) (SearchScope, error) {
 	// All exact-read operations use a deadline as well, including the privilege snapshot.
-	ctx, cancel := context.WithTimeout(c.Request.Context(), searchTimeout)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), restoreTimeout)
 	// The handler calls the returned cleanup through the request lifecycle below.
 	c.Set("nugetReadCancel", cancel)
 	c.Request = c.Request.WithContext(ctx)
