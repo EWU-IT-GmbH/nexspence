@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/nexspence-oss/nexspence/internal/domain"
 	"github.com/nexspence-oss/nexspence/internal/formats/nuget"
@@ -502,4 +503,42 @@ func TestFederatedFixedPriorityBeforePagination(t *testing.T) {
 		}
 	}
 	require.True(t, exactRequest)
+}
+
+// A cold restore must tolerate queued metadata reads beyond the search deadline.
+func TestGroupRestoreOutlivesSearchDeadline(t *testing.T) {
+	f := hosted(t)
+	packages := map[string][]remoteTestVersion{}
+	for i := 0; i < 8; i++ {
+		packages[fmt.Sprintf("cold%d", i)] = []remoteTestVersion{{"1.0.0", "", true, 1, nil}}
+	}
+	feed := newRemoteFeed(t, packages)
+	original := feed.server.Config.Handler
+	feed.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/metadata/") || r.URL.Path == "/find" {
+			select {
+			case <-time.After(5250 * time.Millisecond):
+			case <-r.Context().Done():
+				return
+			}
+		}
+		original.ServeHTTP(w, r)
+	})
+	f.addRemote(t, "remote", feed)
+	f.addRepo(t, "all", domain.TypeGroup, "hosted", "remote")
+	results := make(chan *httptest.ResponseRecorder, 8)
+	for i := 0; i < 8; i++ {
+		go func(i int) {
+			results <- f.requestRepo(t, "GET", "all", fmt.Sprintf("/v3/flatcontainer/cold%d/index.json", i), "admin")
+		}(i)
+	}
+	for i := 0; i < 8; i++ {
+		w := <-results
+		require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+		require.JSONEq(t, `{"versions":["1.0.0"]}`, w.Body.String())
+	}
+	// Interactive searches retain their short deadline against the same slow feed.
+	w := f.requestRepo(t, "GET", "all", "/v3/query?q=cold", "admin")
+	require.Equal(t, http.StatusServiceUnavailable, w.Code, w.Body.String())
+	require.Contains(t, w.Body.String(), "search_timeout")
 }

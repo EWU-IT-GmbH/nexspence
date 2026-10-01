@@ -123,7 +123,8 @@ func TestNuGetUpstreamParallelismIsBounded(t *testing.T) {
 	case <-started:
 		close(release)
 		t.Fatal("more than four upstream requests")
-	case <-time.After(20 * time.Millisecond):
+	// A cold restore can wait longer than the interactive search budget.
+	case <-time.After(searchTimeout + 250*time.Millisecond):
 	}
 	close(release)
 	wg.Wait()
