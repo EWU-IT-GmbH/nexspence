@@ -6,6 +6,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/nexspence-oss/nexspence/internal/domain"
+	"github.com/nexspence-oss/nexspence/internal/formats/repoproxy"
 )
 
 // Search resources may live on a different origin from the service index.
@@ -32,7 +33,9 @@ func (h *Handler) serveProxySearch(c *gin.Context, repo *domain.Repository) {
 		query[key] = values
 	}
 	u.RawQuery = query.Encode()
-	body, err := fetchNuGetJSON(c.Request.Context(), repo, u.String(), remoteCollectionBytes)
+	// Only the resource discovered from this repository's service index is trusted.
+	ctx := repoproxy.WithTrustedAuthBases(c.Request.Context(), target)
+	body, err := fetchNuGetJSON(ctx, repo, u.String(), remoteCollectionBytes)
 	if err != nil {
 		writeQueryError(c, err)
 		return

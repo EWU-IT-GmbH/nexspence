@@ -248,6 +248,27 @@ func (h *Handler) collectTags(ctx context.Context, repoName, imageName string) (
 
 // ─── Manifests ─────────────────────────────────────────────────────────────
 
+// unauthorizedAsNotFound maps an upstream 401 to 404 so group first-non-404
+// fan-out continues. Docker Hub answers a name it does not host with 401
+// insufficient_scope. 403 stays 403: on this protocol that status is a refusal,
+// not "some other registry has the blob".
+type unauthorizedAsNotFound struct{ gin.ResponseWriter }
+
+func (w unauthorizedAsNotFound) WriteHeader(code int) {
+	if code == http.StatusUnauthorized {
+		code = http.StatusNotFound
+	}
+	w.ResponseWriter.WriteHeader(code)
+}
+
+// maskUpstreamAuthMiss installs unauthorizedAsNotFound while a group is
+// walking members. A request addressed at the member itself is left alone.
+func maskUpstreamAuthMiss(c *gin.Context) {
+	if c.GetBool(formats.GroupMemberKey) {
+		c.Writer = unauthorizedAsNotFound{ResponseWriter: c.Writer}
+	}
+}
+
 func (h *Handler) handleManifests(c *gin.Context, repoName, imageName, reference string) {
 	repo, _ := h.deps.Repos.Get(c.Request.Context(), repoName)
 	switch c.Request.Method {
@@ -264,6 +285,12 @@ func (h *Handler) handleManifests(c *gin.Context, repoName, imageName, reference
 			if !strings.HasPrefix(reference, "sha256:") {
 				maxAge = repoproxy.MetadataMaxAge(repo)
 			}
+			// A registry that does not host this image often answers 401
+			// (Docker Hub insufficient_scope) rather than 404. During group
+			// fan-out that is a miss: the next member may hold it. A direct
+			// pull keeps the 401, so a wrong upstream credential is not
+			// reported as "no such image".
+			maskUpstreamAuthMiss(c)
 			if err := repoproxy.ServeGET(c, h.deps, repo, cachePath, upPath, coords, ct, maxAge); err != nil {
 				dockerError(c, http.StatusBadGateway, "UNKNOWN", err.Error())
 				return
@@ -352,6 +379,13 @@ func (h *Handler) pushManifest(c *gin.Context, repoName, imageName, reference st
 		}
 	}
 
+	// A tag about to be overwritten may still share its object with the digest
+	// alias of the manifest it holds now — every alias did before #594. Give
+	// that alias its own copy first, or the old digest serves the new bytes.
+	if !strings.Contains(reference, ":") {
+		h.detachDigestAlias(c.Request.Context(), repoName, imageName, fp)
+	}
+
 	res, err := base.StoreArtifact(c.Request.Context(), h.deps,
 		repoName, fp, ct, coords,
 		bytes.NewReader(body), int64(len(body)))
@@ -371,20 +405,12 @@ func (h *Handler) pushManifest(c *gin.Context, repoName, imageName, reference st
 		_ = h.deps.Components.UpdateExtra(c.Request.Context(), res.Asset.ComponentID, extra)
 	}
 
-	// Docker pulls always re-fetch the manifest by content digest after getting it by tag.
-	// Register a second asset record pointing to the same blob under the digest path so
-	// GET /manifests/<img>/sha256:<digest> also resolves correctly.
+	// Docker pulls always re-fetch the manifest by content digest after getting
+	// it by tag, so the manifest is also stored under its digest path.
 	digestRef := "sha256:" + res.SHA256
 	if reference != digestRef {
 		if repo, err2 := h.deps.Repos.Get(c.Request.Context(), repoName); err2 == nil && repo != nil {
-			// Pinned to the store the manifest bytes went to. Re-resolving would
-			// let a group store round-robin the alias onto a different member,
-			// which holds neither the object the alias names nor its size.
-			alias, aerr := base.RegisterStoredBlob(c.Request.Context(), h.deps, repo,
-				manifestPath(imageName, digestRef), ct,
-				base.Coords{Name: imageName, Version: digestRef},
-				res.Asset.BlobKey,
-				res.SHA256, res.SHA1, res.MD5, res.Size, res.Asset.BlobStoreID, "")
+			alias, aerr := h.storeDigestAlias(c.Request.Context(), repo, imageName, digestRef, ct, body, res.Asset)
 			// The alias carries the same metadata: the referrers API resolves a
 			// subject by digest, not by tag.
 			if aerr == nil && alias != nil && len(extra) > 0 {
@@ -397,6 +423,61 @@ func (h *Handler) pushManifest(c *gin.Context, repoName, imageName, reference st
 	c.Header("Docker-Content-Digest", digest)
 	c.Header("Location", "/v2/"+imageName+"/manifests/"+digest)
 	c.Status(http.StatusCreated)
+}
+
+// storeDigestAlias stores a manifest under its digest path as an object of its
+// own. That path's blob key is fixed by the digest, so re-pushing the tag —
+// which overwrites the tag's object in place — cannot change what the digest
+// serves (#594). It goes to the store of pin, the tag's asset.
+func (h *Handler) storeDigestAlias(ctx context.Context, repo *domain.Repository,
+	imageName, digestRef, ct string, body []byte, pin *domain.Asset,
+) (*domain.Asset, error) {
+	return base.StorePinnedCopy(ctx, h.deps, repo, manifestPath(imageName, digestRef), ct,
+		base.Coords{Name: imageName, Version: digestRef}, body, pin)
+}
+
+// detachDigestAlias moves the digest alias of the manifest a tag holds onto an
+// object of its own when it still shares the tag's — the layout every push
+// made before #594. Best effort: on any failure the alias stays as it was.
+func (h *Handler) detachDigestAlias(ctx context.Context, repoName, imageName, tagPath string) {
+	tag, err := h.deps.Assets.GetByPath(ctx, repoName, tagPath)
+	if err != nil || tag == nil || tag.SHA256 == "" {
+		return
+	}
+	digestRef := "sha256:" + tag.SHA256
+	alias, err := h.deps.Assets.GetByPath(ctx, repoName, manifestPath(imageName, digestRef))
+	if err != nil || alias == nil || alias.BlobKey != tag.BlobKey {
+		return
+	}
+	repo, err := h.deps.Repos.Get(ctx, repoName)
+	if err != nil || repo == nil || base.CheckWritable(repo) != nil {
+		return
+	}
+	store, err := base.AssetPhysicalStore(ctx, h.deps, tag)
+	if err != nil {
+		return
+	}
+	rc, _, err := store.Get(ctx, tag.BlobKey)
+	if err != nil {
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(rc, maxManifestBytes+1))
+	_ = rc.Close()
+	if err != nil || len(body) > maxManifestBytes {
+		return
+	}
+	if sum := sha256.Sum256(body); hex.EncodeToString(sum[:]) != tag.SHA256 {
+		return
+	}
+	// The upsert replaces the component's metadata; carry it over.
+	var extra map[string]any
+	if comp, cerr := h.deps.Components.Get(ctx, alias.ComponentID); cerr == nil && comp != nil {
+		extra = comp.Extra
+	}
+	moved, err := h.storeDigestAlias(ctx, repo, imageName, digestRef, alias.ContentType, body, alias)
+	if err == nil && moved != nil && len(extra) > 0 {
+		_ = h.deps.Components.UpdateExtra(ctx, moved.ComponentID, extra)
+	}
 }
 
 // recordCachedManifestMeta types a manifest that repoproxy has just written to
@@ -464,12 +545,100 @@ func (h *Handler) recordCachedManifestMeta(ctx context.Context, repo *domain.Rep
 }
 
 func (h *Handler) deleteManifest(c *gin.Context, repoName, imageName, reference string) {
+	ctx := c.Request.Context()
 	fp := manifestPath(imageName, reference)
-	if err := base.DeleteArtifact(c.Request.Context(), h.deps, repoName, fp); err != nil {
+	// Deleting by tag only untags: the manifest stays reachable by digest,
+	// which is what a deployment pinned to it pulls.
+	if !strings.Contains(reference, ":") {
+		if err := base.DeleteArtifact(ctx, h.deps, repoName, fp); err != nil {
+			dockerError(c, http.StatusInternalServerError, "UNKNOWN", err.Error())
+			return
+		}
+		c.Status(http.StatusAccepted)
+		return
+	}
+	// Deleting by digest deletes the manifest: the tags that resolve to it go
+	// too, or they stay listed while their digest answers 404 (#620). What the
+	// image no longer needs afterwards — blobs no manifest left is built from,
+	// index children nothing else names — is released with it.
+	tags, err := h.tagsResolvingTo(ctx, repoName, imageName, strings.TrimPrefix(reference, "sha256:"))
+	if err != nil {
 		dockerError(c, http.StatusInternalServerError, "UNKNOWN", err.Error())
 		return
 	}
+	targets := tags
+	targets = append(targets, fp)
+
+	released := map[string][]byte{}
+	for _, fp := range targets {
+		a, err := h.deps.Assets.GetByPath(ctx, repoName, fp)
+		if err != nil || a == nil {
+			continue
+		}
+		body, err := h.readAsset(ctx, a)
+		if err != nil {
+			dockerError(c, http.StatusInternalServerError, "UNKNOWN", err.Error())
+			return
+		}
+		if err := base.DeleteArtifact(ctx, h.deps, repoName, fp); err != nil {
+			dockerError(c, http.StatusInternalServerError, "UNKNOWN", err.Error())
+			return
+		}
+		released[a.SHA256] = body
+	}
+	if len(released) > 0 {
+		release, err := PlanImageRelease(ctx, h.deps.Assets, h.readAsset, repoName, imageName, released)
+		if err != nil {
+			dockerError(c, http.StatusInternalServerError, "UNKNOWN", err.Error())
+			return
+		}
+		for _, fp := range release {
+			if err := base.DeleteArtifact(ctx, h.deps, repoName, fp); err != nil {
+				dockerError(c, http.StatusInternalServerError, "UNKNOWN", err.Error())
+				return
+			}
+		}
+		_ = h.deps.Components.DeleteOrphans(ctx, repoName)
+	}
 	c.Status(http.StatusAccepted)
+}
+
+// tagsResolvingTo returns the tag paths of imageName whose manifest has the
+// given hex sha256.
+func (h *Handler) tagsResolvingTo(ctx context.Context, repoName, imageName, sha string) ([]string, error) {
+	prefix := manifestPath(imageName, "")
+	listed, err := h.deps.Assets.ListByRepoAndPath(ctx, repoName, prefix)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, a := range listed {
+		ref := strings.TrimPrefix(a.Path, prefix)
+		if ref != "" && !strings.ContainsAny(ref, "/:") && a.SHA256 == sha {
+			out = append(out, a.Path)
+		}
+	}
+	return out, nil
+}
+
+// readAsset returns a stored asset's bytes from the store that holds it.
+func (h *Handler) readAsset(ctx context.Context, a *domain.Asset) ([]byte, error) {
+	store := h.deps.BlobStore
+	if a.BlobStoreID != "" {
+		bs, err := h.deps.Blobs.GetByID(ctx, a.BlobStoreID)
+		if err != nil {
+			return nil, err
+		}
+		if store, err = base.PhysicalStore(ctx, h.deps, bs); err != nil {
+			return nil, err
+		}
+	}
+	rc, _, err := store.Get(ctx, a.BlobKey)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rc.Close() }()
+	return io.ReadAll(rc)
 }
 
 // ─── Blobs ─────────────────────────────────────────────────────────────────
@@ -496,6 +665,10 @@ func (h *Handler) handleBlobs(c *gin.Context, repoName, imageName, digest string
 			upPath := "/v2/" + imageName + "/blobs/" + digest
 			coords := base.Coords{Name: imageName, Version: digest}
 			// Blobs are content-addressed by digest — immutable, never revalidate.
+			// Same 401-as-miss rule as manifests: a group pull fetches layers
+			// through the group too, and the member that 401s on the manifest
+			// 401s on the blob.
+			maskUpstreamAuthMiss(c)
 			if err := repoproxy.ServeGET(c, h.deps, repo, cachePath, upPath, coords, "application/octet-stream", 0); err != nil {
 				dockerError(c, http.StatusBadGateway, "UNKNOWN", err.Error())
 			}

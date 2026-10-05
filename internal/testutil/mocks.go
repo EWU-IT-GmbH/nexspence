@@ -385,7 +385,13 @@ func (c *ComponentRepo) ListByRepoNames(_ context.Context, names []string, limit
 		if items[i].Name != items[j].Name {
 			return items[i].Name < items[j].Name
 		}
-		return items[i].Version < items[j].Version
+		if items[i].Version != items[j].Version {
+			return items[i].Version < items[j].Version
+		}
+		if items[i].Group != items[j].Group {
+			return items[i].Group < items[j].Group
+		}
+		return items[i].ID < items[j].ID
 	})
 
 	if limit <= 0 {
@@ -435,6 +441,16 @@ func (c *ComponentRepo) Search(_ context.Context, params domain.SearchParams) (*
 				continue
 			}
 		}
+		// Only exact lookups filter by coordinates: the substring semantics of
+		// the SQL layer are not modeled, and existing tests rely on that.
+		if params.Exact {
+			if (params.Group != "" && v.Group != params.Group) ||
+				(params.Name != "" && v.Name != params.Name) ||
+				(params.Version != "" && v.Version != params.Version) ||
+				(params.Format != "" && v.Format != params.Format) {
+				continue
+			}
+		}
 		items = append(items, *v)
 	}
 	// Mirror the SQL layer's ordering, limit clamp and continuation token
@@ -445,7 +461,13 @@ func (c *ComponentRepo) Search(_ context.Context, params domain.SearchParams) (*
 		if items[i].Name != items[j].Name {
 			return items[i].Name < items[j].Name
 		}
-		return items[i].Version < items[j].Version
+		if items[i].Version != items[j].Version {
+			return items[i].Version < items[j].Version
+		}
+		if items[i].Group != items[j].Group {
+			return items[i].Group < items[j].Group
+		}
+		return items[i].ID < items[j].ID
 	})
 	limit := params.Limit
 	if limit <= 0 {
@@ -515,7 +537,13 @@ func (c *ComponentRepo) ListOCIReferrers(_ context.Context, repoNames []string, 
 		if items[i].Name != items[j].Name {
 			return items[i].Name < items[j].Name
 		}
-		return items[i].Version < items[j].Version
+		if items[i].Version != items[j].Version {
+			return items[i].Version < items[j].Version
+		}
+		if items[i].Group != items[j].Group {
+			return items[i].Group < items[j].Group
+		}
+		return items[i].ID < items[j].ID
 	})
 	return items, nil
 }
@@ -2610,6 +2638,8 @@ type ReplicationRepo struct {
 	mu      sync.Mutex
 	rules   map[string]*domain.ReplicationRule
 	history []domain.ReplicationHistory
+
+	ListErr error // when set, ListRules returns it
 }
 
 func NewReplicationRepo() *ReplicationRepo {
@@ -2619,6 +2649,9 @@ func NewReplicationRepo() *ReplicationRepo {
 func (r *ReplicationRepo) ListRules(_ context.Context) ([]domain.ReplicationRule, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.ListErr != nil {
+		return nil, r.ListErr
+	}
 	out := make([]domain.ReplicationRule, 0, len(r.rules))
 	for _, v := range r.rules {
 		out = append(out, *v)

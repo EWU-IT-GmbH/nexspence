@@ -2,6 +2,7 @@ package formats
 
 import (
 	"context"
+	"time"
 
 	"github.com/nexspence-oss/nexspence/internal/domain"
 	"github.com/nexspence-oss/nexspence/internal/repository"
@@ -44,6 +45,10 @@ type Deps struct {
 	// image layers are not truncated, which leaves this as their only bound.
 	// 0 disables the cap.
 	MaxUploadBytes int64
+	// HelmIndexCacheTTL is how long a Helm proxy reuses an upstream index.yaml
+	// when resolving where a chart tarball comes from (config helm.index_cache_ttl).
+	// 0 fetches the index per lookup.
+	HelmIndexCacheTTL time.Duration
 }
 
 // TokenIssuer mints a bearer token for an already-authenticated caller.
@@ -59,6 +64,22 @@ type TokenIssuer interface {
 	// have been authenticated already: this issues credentials, it does not
 	// check them.
 	GenerateToken(userID, username string, roles []string) (string, error)
+}
+
+// ScopedTokenIssuer is implemented by token issuers that can embed an API
+// token's scopes into the minted token (*auth.Service does). A login
+// handshake authenticated with a scoped token must mint through it, so the
+// session is no wider than the token it came from (#292, #567).
+type ScopedTokenIssuer interface {
+	GenerateScopedToken(userID, username string, roles, scopes []string) (string, error)
+}
+
+// APITokenIssuer is implemented by token issuers that can bind the minted
+// token to the API token the caller logged in with (*auth.Service does): it
+// carries the token's scopes, names the token so deleting it revokes the
+// session, and expires no later than the token (#566, #567).
+type APITokenIssuer interface {
+	GenerateAPITokenJWT(userID, username string, roles, scopes []string, tokenID string, tokenExpiresAt *time.Time) (string, time.Time, error)
 }
 
 // ScanTrigger requests a background vulnerability scan of a stored component.

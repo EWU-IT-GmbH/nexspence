@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/nexspence-oss/nexspence/internal/domain"
+	"github.com/nexspence-oss/nexspence/internal/formats/repoproxy"
 	"github.com/nexspence-oss/nexspence/internal/nugetmeta"
 	"github.com/nexspence-oss/nexspence/internal/repository"
 )
@@ -28,6 +29,9 @@ func (h *Handler) remoteRegistration(ctx context.Context, repo *domain.Repositor
 	if err != nil {
 		return nil, err
 	}
+	// Trust the discovered registration host, including when discovery is cached.
+	// Page links on other hosts do not expand this credential scope.
+	ctx = repoproxy.WithTrustedAuthBases(ctx, root)
 	u, _ := url.Parse(root)
 	u.Path = strings.TrimRight(u.Path, "/") + "/" + url.PathEscape(id) + "/index.json"
 	u.RawPath = ""

@@ -200,6 +200,18 @@ func (r *assetRepo) SearchAssets(ctx context.Context, p domain.SearchParams) (*d
 	return &domain.Page[domain.Asset]{Items: items, ContinuationToken: token}, nil
 }
 
+// hostedOCINonTag is the SQL condition matching rows of a hosted docker/oci
+// repository that are not a tag manifest: blobs and sha256: digest aliases.
+// asset may be empty when the query has no asset row (only the version is
+// checked then).
+func hostedOCINonTag(rep, comp, asset string) string {
+	nonTag := comp + ".version LIKE 'sha256:%'"
+	if asset != "" {
+		nonTag = "(" + nonTag + " OR " + asset + ".path LIKE '/blobs/%')"
+	}
+	return rep + ".type = 'hosted' AND " + comp + ".format IN ('docker', 'oci') AND " + nonTag
+}
+
 func (r *assetRepo) ListStale(ctx context.Context, format string, repoNames []string, lastDownloadedDays, artifactAgeDays int, pathPrefix, nameGlob string, retainNVersions int, limit int) ([]domain.Asset, error) {
 	if limit <= 0 {
 		limit = 500
@@ -225,19 +237,24 @@ WITH retained_comps AS (
         ORDER BY comp2.version_sort DESC, comp2.created_at DESC
       ) rn
     FROM components comp2
-    WHERE comp2.repository_id IN (
-      SELECT id FROM repositories WHERE name = ANY($%d::text[])
-    )
+    JOIN repositories rep2 ON rep2.id = comp2.repository_id
+    WHERE rep2.name = ANY($%d::text[])
+      AND NOT (%s)
   ) r WHERE rn <= $%d
 )
-`, i, i+1)
+`, i, hostedOCINonTag("rep2", "comp2", ""), i+1)
 		repoArgIdx = i
 		args = append(args, repoNames, retainNVersions)
 		i += 2
 		cteExclude = " AND comp.id NOT IN (SELECT id FROM retained_comps)"
 	}
 
-	where := "WHERE 1=1"
+	// Hosted docker/oci repositories store an image as many components that
+	// share its name: the tag manifest, digest aliases, layers and configs.
+	// Only the tag is a release; the rest is still referenced by live tags,
+	// so it is never an age or retention candidate (#596). A proxy keeps its
+	// cached layers evictable: they are re-fetched from upstream on demand.
+	where := "WHERE NOT (" + hostedOCINonTag("rep", "comp", "a") + ")"
 
 	if len(repoNames) > 0 {
 		if repoArgIdx > 0 {
@@ -391,8 +408,8 @@ func (r *assetRepo) ListAllBlobRefs(ctx context.Context) ([]domain.BlobRef, erro
 }
 
 // SumSizeByRepo returns the bytes the repository occupies: one size per stored
-// object, since several assets can name one — an OCI manifest's tag and its
-// digest alias, a blob mounted from another image in the same repository.
+// object, since several assets can name one — a blob mounted from another
+// image in the same repository, or an OCI digest alias stored before #594.
 // Charging a repository once per asset row put it over its quota at half the
 // bytes it actually stored (issue #146). Rows that disagree about the size of a
 // key are read at their largest, the reading that cannot let a quota overrun.

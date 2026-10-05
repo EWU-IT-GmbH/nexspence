@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/nexspence-oss/nexspence/internal/domain"
+	"github.com/nexspence-oss/nexspence/internal/formats/repoproxy"
 	"github.com/nexspence-oss/nexspence/internal/nugetmeta"
 )
 
@@ -205,6 +206,7 @@ func (h *Handler) remoteSearch(ctx context.Context, repo *domain.Repository, cal
 		q.Del("semVerLevel")
 	}
 	u.RawQuery = q.Encode()
+	ctx = repoproxy.WithTrustedAuthBases(ctx, resource)
 	b, err := fetchNuGetJSON(ctx, repo, u.String(), remoteCollectionBytes)
 	if err != nil {
 		return out, err

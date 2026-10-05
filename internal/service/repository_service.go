@@ -91,7 +91,7 @@ func (s *RepositoryService) Create(ctx context.Context, r *domain.Repository) er
 	if r.Type == "" {
 		return fmt.Errorf("%w: type is required", ErrInvalidInput)
 	}
-	if err := validateNameForFormat(r.Name, r.Format); err != nil {
+	if err := validateRepoIdentity(r); err != nil {
 		return err
 	}
 	if err := validateWritePolicy(r); err != nil {
@@ -350,6 +350,21 @@ var reservedV2Names = map[string]bool{
 	"_catalog":   true, // the instance-level catalog (also fails the grammar above)
 }
 
+// validateRepoIdentity checks what every path that creates a repository —
+// the API, a backup import, a full restore — must agree on: a format and type
+// the server serves (#593) and a name its clients can address (#592, #619).
+// Unknown values would otherwise first be refused by the table's CHECK
+// constraints, as a raw driver error.
+func validateRepoIdentity(r *domain.Repository) error {
+	if !r.Format.Valid() {
+		return fmt.Errorf("%w: unknown format %q", ErrInvalidInput, r.Format)
+	}
+	if !r.Type.Valid() {
+		return fmt.Errorf("%w: unknown type %q — use hosted, proxy or group", ErrInvalidInput, r.Type)
+	}
+	return validateNameForFormat(r.Name, r.Format)
+}
+
 // validateNameForFormat rejects repository names the format's own clients
 // cannot address. Only the OCI-registry formats are gated: their grammar is
 // strict and a violating repository is dead on arrival, while other formats
@@ -357,6 +372,12 @@ var reservedV2Names = map[string]bool{
 // this runs on create, where the trap is sprung.
 func validateNameForFormat(name string, format domain.RepoFormat) error {
 	if !format.IsOCIRegistry() {
+		if !domain.IsAddressableName(name) {
+			return fmt.Errorf(
+				"%w: %q cannot be used in a URL — a repository name must not be \".\" or \"..\" "+
+					"or contain a space, a control character or one of / \\ ? # %%",
+				ErrInvalidInput, name)
+		}
 		return nil
 	}
 	if !domain.IsDockerPathComponent(name) {
