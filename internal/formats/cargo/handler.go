@@ -133,8 +133,27 @@ func (h *Handler) serveIndexConfig(c *gin.Context, repoName string) {
 	c.JSON(http.StatusOK, gin.H{
 		"dl":            baseURL + "/api/v1/crates/{crate}/{version}/download",
 		"api":           baseURL,
-		"auth-required": false,
+		"auth-required": h.indexAuthRequired(c.Request.Context(), repoName),
 	})
+}
+
+// indexAuthRequired reports whether an anonymous client is refused reads.
+// Cargo sends its token on index and download requests only when config.json
+// says auth-required: answering false for a private repository let cargo
+// read the index (it retries config.json with the token after a 401) and
+// then download every crate without one, into a 401 (#588). When the answer
+// cannot be worked out, the token is asked for: sending one to a public
+// repository is harmless.
+func (h *Handler) indexAuthRequired(ctx context.Context, repoName string) bool {
+	if h.deps.RBAC == nil {
+		return false
+	}
+	repo, err := h.deps.Repos.Get(ctx, repoName)
+	if err != nil || repo == nil {
+		return true
+	}
+	allowed, err := h.deps.RBAC.CanAccessRepo(ctx, "", nil, repo, "/", "read")
+	return err != nil || !allowed
 }
 
 func (h *Handler) serveIndexEntry(c *gin.Context, repoName, p string) {
@@ -146,21 +165,25 @@ func (h *Handler) serveIndexEntry(c *gin.Context, repoName, p string) {
 	}
 	crateName := parts[len(parts)-1]
 
-	page, err := h.deps.Components.Search(c.Request.Context(), domain.SearchParams{
-		Repository: repoName, Name: crateName, Limit: 200,
+	// Every version of exactly this crate (names are lowercased on publish).
+	// Search matches substrings, where "_" is a wildcard too: it listed
+	// rvc-serde-json under rvc-serde, and a crate with enough versions whose
+	// name contained this one pushed it off the page entirely (#586).
+	comps, err := base.ExactComponents(c.Request.Context(), h.deps.Components, domain.SearchParams{
+		Repository: repoName, Name: strings.ToLower(crateName),
 	})
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	if len(page.Items) == 0 {
+	if len(comps) == 0 {
 		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
 		return
 	}
 
 	// Sparse index: newline-delimited JSON records
 	var sb strings.Builder
-	for _, comp := range page.Items {
+	for _, comp := range comps {
 		asset, _ := h.deps.Assets.GetByPath(c.Request.Context(), repoName,
 			"/api/v1/crates/"+crateName+"/"+comp.Version+"/"+crateName+"-"+comp.Version+".crate")
 		checksum := ""
@@ -174,6 +197,24 @@ func (h *Handler) serveIndexEntry(c *gin.Context, repoName, p string) {
 			"cksum":    checksum,
 			"features": map[string]any{},
 			"yanked":   false,
+		}
+		// Crates published before #587 carry no stored metadata and keep the
+		// empty deps and features until they are published again.
+		if deps, ok := comp.Extra[extraDeps]; ok && deps != nil {
+			rec["deps"] = deps
+		}
+		if feats, ok := comp.Extra[extraFeatures]; ok && feats != nil {
+			rec["features"] = feats
+		}
+		if feats2, ok := comp.Extra[extraFeatures2]; ok && feats2 != nil {
+			rec["features2"] = feats2
+			rec["v"] = 2
+		}
+		if links, ok := comp.Extra[extraLinks].(string); ok && links != "" {
+			rec["links"] = links
+		}
+		if rv, ok := comp.Extra[extraRustVersion].(string); ok && rv != "" {
+			rec["rust_version"] = rv
 		}
 		b, _ := json.Marshal(rec)
 		sb.Write(b)
@@ -222,10 +263,7 @@ func (h *Handler) handlePublish(c *gin.Context, repoName string) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "cannot read metadata"})
 		return
 	}
-	var meta struct {
-		Name    string `json:"name"`
-		Version string `json:"vers"`
-	}
+	var meta publishMeta
 	if err := json.Unmarshal(metaBytes, &meta); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid metadata JSON"})
 		return
@@ -243,12 +281,21 @@ func (h *Handler) handlePublish(c *gin.Context, repoName string) {
 	filePath := "/api/v1/crates/" + name + "/" + version + "/" + filename
 
 	coords := base.Coords{Name: name, Version: version}
-	if _, err := base.StoreArtifact(c.Request.Context(), h.deps,
+	res, err := base.StoreArtifact(c.Request.Context(), h.deps,
 		repoName, filePath, "application/x-tar", coords,
-		io.LimitReader(c.Request.Body, int64(crateLen)), int64(crateLen)); err != nil {
+		io.LimitReader(c.Request.Body, int64(crateLen)), int64(crateLen))
+	if err != nil {
 		// crateLen comes from the request body itself, so a body that does not
 		// deliver it is the publisher's error, not ours — see base.ErrSizeMismatch.
 		c.JSON(base.HTTPStatusForError(err), gin.H{"error": err.Error()})
+		return
+	}
+	// The sparse index is built from these: without them a crate is served as
+	// having no dependencies and no features (#587). A publish that cannot
+	// record them fails, so the client retries instead of leaving a crate
+	// nobody can build against.
+	if err := h.deps.Components.UpdateExtra(c.Request.Context(), res.Asset.ComponentID, meta.indexExtra()); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "store crate metadata: " + err.Error()})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"warnings": gin.H{"invalid_categories": []string{}, "invalid_badges": []string{}, "other": []string{}}})

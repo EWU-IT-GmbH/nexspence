@@ -91,7 +91,7 @@ func (s *RepositoryService) Create(ctx context.Context, r *domain.Repository) er
 	if r.Type == "" {
 		return fmt.Errorf("%w: type is required", ErrInvalidInput)
 	}
-	if err := validateNameForFormat(r.Name, r.Format); err != nil {
+	if err := validateRepoIdentity(r); err != nil {
 		return err
 	}
 	if err := validateWritePolicy(r); err != nil {
@@ -178,13 +178,16 @@ func (s *RepositoryService) Update(ctx context.Context, name string, updates *do
 		r.Description = updates.Description
 	}
 	if updates.FormatConfig != nil {
+		// Readers only ever see "<key>_set" for a signing secret, so an edit
+		// that round-trips the config must keep the stored one.
+		merged := mergeSecretConfig(r.FormatConfig, updates.FormatConfig, domain.FormatConfigSecretKeys())
 		// Validated before it is applied, so a refused update leaves r as read.
 		candidate := *r
-		candidate.FormatConfig = updates.FormatConfig
+		candidate.FormatConfig = merged
 		if err := validateWritePolicy(&candidate); err != nil {
 			return nil, err
 		}
-		r.FormatConfig = updates.FormatConfig
+		r.FormatConfig = merged
 	}
 	if updates.HTTPConfig != nil {
 		r.HTTPConfig = updates.HTTPConfig
@@ -312,27 +315,34 @@ func validateWritePolicy(r *domain.Repository) error {
 // Sending an explicit empty value clears the credential. The read-only *_set
 // markers a client may echo back are always dropped.
 func mergeProxyConfig(stored, updates map[string]any) map[string]any {
-	secrets := [][2]string{
-		{domain.ProxyPasswordKey, domain.ProxyPasswordSetKey},
-		{domain.RemotePasswordKey, domain.RemotePasswordSetKey},
+	return mergeSecretConfig(stored, updates, []string{domain.ProxyPasswordKey, domain.RemotePasswordKey})
+}
+
+// mergeSecretConfig applies updates to a config map whose secrets are served
+// redacted. For each secret key: absent from updates → the stored value is
+// kept; an explicit empty string → removed; anything else → replaced. The
+// read-only "<key>_set" markers a client echoes back are never stored.
+func mergeSecretConfig(stored, updates map[string]any, secretKeys []string) map[string]any {
+	markers := make(map[string]bool, len(secretKeys))
+	for _, k := range secretKeys {
+		markers[k+"_set"] = true
 	}
-	merged := make(map[string]any, len(updates)+len(secrets))
+	merged := make(map[string]any, len(updates)+len(secretKeys))
 	for k, v := range updates {
-		if k == domain.ProxyPasswordSetKey || k == domain.RemotePasswordSetKey {
+		if markers[k] {
 			continue
 		}
 		merged[k] = v
 	}
-	for _, keys := range secrets {
-		secretKey := keys[0]
-		if pw, sent := merged[secretKey]; sent {
-			if s, _ := pw.(string); s == "" {
+	for _, secretKey := range secretKeys {
+		if v, sent := merged[secretKey]; sent {
+			if s, _ := v.(string); s == "" {
 				delete(merged, secretKey)
 			}
 			continue
 		}
-		if pw, ok := stored[secretKey].(string); ok && pw != "" {
-			merged[secretKey] = pw
+		if v, ok := stored[secretKey].(string); ok && v != "" {
+			merged[secretKey] = v
 		}
 	}
 	return merged
@@ -349,6 +359,21 @@ var reservedV2Names = map[string]bool{
 	"_catalog":   true, // the instance-level catalog (also fails the grammar above)
 }
 
+// validateRepoIdentity checks what every path that creates a repository —
+// the API, a backup import, a full restore — must agree on: a format and type
+// the server serves (#593) and a name its clients can address (#592, #619).
+// Unknown values would otherwise first be refused by the table's CHECK
+// constraints, as a raw driver error.
+func validateRepoIdentity(r *domain.Repository) error {
+	if !r.Format.Valid() {
+		return fmt.Errorf("%w: unknown format %q", ErrInvalidInput, r.Format)
+	}
+	if !r.Type.Valid() {
+		return fmt.Errorf("%w: unknown type %q — use hosted, proxy or group", ErrInvalidInput, r.Type)
+	}
+	return validateNameForFormat(r.Name, r.Format)
+}
+
 // validateNameForFormat rejects repository names the format's own clients
 // cannot address. Only the OCI-registry formats are gated: their grammar is
 // strict and a violating repository is dead on arrival, while other formats
@@ -356,6 +381,12 @@ var reservedV2Names = map[string]bool{
 // this runs on create, where the trap is sprung.
 func validateNameForFormat(name string, format domain.RepoFormat) error {
 	if !format.IsOCIRegistry() {
+		if !domain.IsAddressableName(name) {
+			return fmt.Errorf(
+				"%w: %q cannot be used in a URL — a repository name must not be \".\" or \"..\" "+
+					"or contain a space, a control character or one of / \\ ? # %%",
+				ErrInvalidInput, name)
+		}
 		return nil
 	}
 	if !domain.IsDockerPathComponent(name) {

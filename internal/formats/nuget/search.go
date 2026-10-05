@@ -280,8 +280,10 @@ func packageCandidates(ctx context.Context, s repository.NuGetSnapshot, scope Se
 				if prior.Path == canonicalPath(prior) {
 					return nil
 				}
-				if c.Path != canonicalPath(c) {
-					return unavailable("search_unavailable")
+				// Legacy spellings denote the same version. Prefer the canonical
+				// path, otherwise select a stable path until the package is repushed.
+				if c.Path != canonicalPath(c) && prior.Path <= c.Path {
+					return nil
 				}
 			}
 		} else {

@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -32,6 +33,7 @@ import (
 	"github.com/nexspence-oss/nexspence/internal/formats/base"
 	"github.com/nexspence-oss/nexspence/internal/formats/repoproxy"
 	"github.com/nexspence-oss/nexspence/internal/nugetmeta"
+	"github.com/nexspence-oss/nexspence/internal/repository"
 )
 
 // Handler serves the NuGet v2/v3 repository protocol.
@@ -169,48 +171,56 @@ func (h *Handler) ServeHTTP(c *gin.Context) {
 	case c.Request.Method == http.MethodPut && p == "/v2/package":
 		h.handlePush(c, repoName)
 
-	// v2 delete: DELETE /v2/packages/:id/:ver
-	case c.Request.Method == http.MethodDelete && strings.HasPrefix(p, "/v2/packages/"):
-		rest := strings.TrimPrefix(p, "/v2/packages/")
-		parts := strings.SplitN(rest, "/", 2)
-		if len(parts) != 2 {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "expected /v2/packages/:id/:version"})
-			return
-		}
-		version, err := nugetmeta.ParseVersion(parts[1])
-		if err != nil || !nugetmeta.ValidID(parts[0]) {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_package_identity"})
-			return
-		}
-		if repo == nil {
-			writeQueryError(c, unavailable("search_unavailable"))
-			return
-		}
-		// The route's RBAC middleware has checked DELETE. Do not require an
-		// unrelated read privilege to resolve equivalent version spellings.
-		scope := SearchScope{Repository: repo, Members: []string{repo.Name}, CanRead: func(string) bool { return true }}
-		ctx, cancel := context.WithTimeout(c.Request.Context(), searchTimeout)
-		defer cancel()
-		records, err := h.exactVersions(ctx, scope, parts[0], true)
-		if err != nil {
-			writeQueryError(c, err)
-			return
-		}
-		for _, record := range records {
-			if record.Metadata.Key == version.Key() {
-				if err := base.DeleteArtifact(ctx, h.deps, repoName, record.Asset.Path); err != nil {
-					writeQueryError(c, err)
-					return
-				}
-				break
-			}
-		}
-
-		c.Status(http.StatusNoContent)
+	// v2 delete: DELETE {PackagePublish}/:id/:ver. The service index
+	// advertises PackagePublish as /v2/package, so that is what
+	// `dotnet nuget delete` sends; /v2/packages/ stays for existing callers.
+	case c.Request.Method == http.MethodDelete &&
+		(strings.HasPrefix(p, "/v2/package/") || strings.HasPrefix(p, "/v2/packages/")):
+		h.handleDelete(c, repoName, p)
 
 	default:
 		c.Status(http.StatusMethodNotAllowed)
 	}
+}
+
+// handleDelete removes one package version (#589). The id and version are
+// matched the way NuGet compares them, not as the user typed them. The version lists
+// are built from components, so the component goes too — a listed version
+// whose package is gone makes restore report the whole feed as invalid.
+func (h *Handler) handleDelete(c *gin.Context, repoName, p string) {
+	rest := strings.TrimPrefix(strings.TrimPrefix(p, "/v2/packages/"), "/v2/package/")
+	parts := strings.SplitN(rest, "/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "expected /v2/package/:id/:version"})
+		return
+	}
+	if _, err := nugetmeta.ParseVersion(parts[1]); err != nil || !nugetmeta.ValidID(parts[0]) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_package_identity"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), searchTimeout)
+	defer cancel()
+	// Every stored casing of the version: they are one NuGet version (#590).
+	paths, err := h.storedNupkgPaths(ctx, repoName, parts[0], parts[1], false)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if len(paths) == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "package not found"})
+		return
+	}
+	for _, filePath := range paths {
+		if err := base.DeleteArtifact(ctx, h.deps, repoName, filePath); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+	}
+	if err := h.deps.Components.DeleteOrphans(ctx, repoName); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.Status(http.StatusNoContent)
 }
 
 func (h *Handler) serveIndex(c *gin.Context, repoName string) {
@@ -231,6 +241,53 @@ func (h *Handler) serveIndex(c *gin.Context, repoName string) {
 			{"@id": base2 + "/v2/", "@type": "LegacyGallery/2.0.0"},
 		},
 	}, false)
+}
+
+// packageVersions returns the stored versions of exactly pkgID. Ids are
+// stored lowercased on push. Search matches substrings, which would list
+// Foo.Abstractions's versions under Foo and stop at one page (#586).
+func (h *Handler) packageVersions(ctx context.Context, repoName, pkgID string) ([]domain.Component, error) {
+	return base.ExactComponents(ctx, h.deps.Components, domain.SearchParams{
+		Repository: repoName, Name: strings.ToLower(pkgID),
+	})
+}
+
+// storedNupkgPaths returns where the packages of one NuGet version are stored:
+// the normalized path every push uses since #590, and the paths of packages
+// pushed before it, stored under the version as written in their nuspec.
+// With firstOnly, a package at the normalized path ends the search.
+func (h *Handler) storedNupkgPaths(ctx context.Context, repoName, id, version string, firstOnly bool) ([]string, error) {
+	var out []string
+	normalized := nupkgPath(id, version)
+	switch _, err := h.deps.Assets.GetByPath(ctx, repoName, normalized); {
+	case err == nil:
+		out = append(out, normalized)
+		if firstOnly {
+			return out, nil
+		}
+	case !errors.Is(err, repository.ErrNotFound):
+		return nil, err
+	}
+	comps, err := h.packageVersions(ctx, repoName, id)
+	if err != nil {
+		return nil, err
+	}
+	key := versionKey(version)
+	for _, comp := range comps {
+		if versionKey(comp.Version) != key {
+			continue
+		}
+		assets, err := h.deps.Assets.ListByComponentID(ctx, comp.ID)
+		if err != nil {
+			return nil, err
+		}
+		for _, a := range assets {
+			if strings.HasSuffix(a.Path, ".nupkg") && a.Path != normalized {
+				out = append(out, a.Path)
+			}
+		}
+	}
+	return out, nil
 }
 
 // OData v2 compatible FindPackagesById response
