@@ -41,13 +41,13 @@ func TestRangeAndLevel(t *testing.T) {
 			t.Fatalf("%s: %v %v", s, v, e)
 		}
 	}
-	for _, s := range []string{"1.0", "[1,2)", "[2.0]", "1.2.*"} {
+	for _, s := range []string{"1.0", "[1,2)", "[2.0]", "1.2.*", "(,)", "(, )"} {
 		v, e := RangeSemVer2(s)
 		if e != nil || v {
 			t.Fatalf("%s: %v %v", s, v, e)
 		}
 	}
-	for _, s := range []string{"(,)", "[1,1)", "1.*.2", "[1,2,3]", "[3,1]", "(1)", "[1"} {
+	for _, s := range []string{"[,]", "[,)", "(,]", "[1,1)", "1.*.2", "[1,2,3]", "[3,1]", "(1)", "[1"} {
 		if _, e := RangeSemVer2(s); e == nil {
 			t.Errorf("accepted %s", s)
 		}

@@ -217,6 +217,10 @@ func RangeSemVer2(s string) (bool, error) {
 		bounds = append(bounds, v)
 	}
 	if len(bounds) == 0 {
+		// NuGet uses an open interval with no endpoints for any version.
+		if len(parts) == 2 && s[0] == '(' && s[len(s)-1] == ')' {
+			return false, nil
+		}
 		return false, fmt.Errorf("empty dependency range")
 	}
 	if len(bounds) == 2 {
